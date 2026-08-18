@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/example/task-processing/internal/audit"
 	"github.com/example/task-processing/internal/domain/job"
 	"github.com/example/task-processing/internal/persistence/postgres"
 	"github.com/example/task-processing/internal/queuebackend"
@@ -30,6 +31,7 @@ type Worker struct {
 	Log         *slog.Logger
 	Middleware  []workermiddleware.Middleware
 	Backends    *queuebackend.Registry
+	AuditSink   audit.Sink
 }
 
 func (w *Worker) Run(ctx context.Context) error {
@@ -110,7 +112,7 @@ func (w *Worker) Run(ctx context.Context) error {
 		case <-outboxTicker.C:
 			w.dispatchOutbox(ctx)
 		case <-auditTicker.C:
-			if _, err := w.Store.DispatchAuditOutbox(ctx, 100); err != nil {
+			if err := w.dispatchAuditOutbox(ctx); err != nil {
 				telemetry.Metrics.MaintenanceFailures.WithLabelValues("audit_outbox").Inc()
 				w.Log.Error("audit outbox dispatch failed", "error", err)
 			}
@@ -202,6 +204,30 @@ func (w *Worker) Run(ctx context.Context) error {
 			}
 		}
 	}
+}
+
+func (w *Worker) dispatchAuditOutbox(ctx context.Context) error {
+	items, err := w.Store.ClaimAuditOutbox(ctx, w.Owner, 100, w.Lease)
+	if err != nil {
+		return err
+	}
+	sink := w.AuditSink
+	if sink == nil {
+		sink, _ = audit.FromEnv()
+	}
+	for _, item := range items {
+		event := audit.Event{ID: item.ID, ProjectID: item.ProjectID, EventType: item.EventType, AggregateType: item.AggregateType, AggregateID: item.AggregateID, Payload: item.Payload, CreatedAt: item.CreatedAt}
+		if deliveryErr := sink.Publish(ctx, event); deliveryErr != nil {
+			telemetry.Metrics.AuditSinkFailures.Inc()
+			_ = w.Store.RecordAuditOutboxFailure(ctx, item, deliveryErr)
+			w.Log.Warn("audit sink delivery failed", "audit_event_id", item.ID, "error", deliveryErr)
+			continue
+		}
+		if err := w.Store.MarkAuditOutboxPublished(ctx, item); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 func (w *Worker) refreshMetrics(parent context.Context) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(parent), time.Second)

@@ -21,6 +21,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
@@ -147,6 +148,7 @@ func (a *API) Router() http.Handler {
 		r.Get("/api/v1/queue-backends", a.listQueueBackends)
 		r.Post("/api/v1/retry-policies", a.createRetryPolicy)
 		r.Post("/api/v1/rate-limit-policies", a.createRateLimitPolicy)
+		r.Post("/api/v1/retention-policies", a.createRetentionPolicy)
 		r.Post("/api/v1/workflows", a.createWorkflow)
 		r.Get("/api/v1/workflows", a.listWorkflows)
 		r.Post("/api/v1/workflows/{id}/runs", a.startWorkflow)
@@ -347,7 +349,7 @@ func routePermission(r *http.Request) string {
 	if strings.Contains(path, "/job-definitions/") && strings.Contains(path, "/run") {
 		return "job:submit"
 	}
-	if strings.Contains(path, "/queues") || strings.Contains(path, "/retry-policies") || strings.Contains(path, "/rate-limit-policies") || strings.Contains(path, "/function-definitions") || strings.Contains(path, "/job-definitions") || strings.Contains(path, "/schedules") {
+	if strings.Contains(path, "/queues") || strings.Contains(path, "/retry-policies") || strings.Contains(path, "/rate-limit-policies") || strings.Contains(path, "/retention-policies") || strings.Contains(path, "/function-definitions") || strings.Contains(path, "/job-definitions") || strings.Contains(path, "/schedules") {
 		if r.Method == http.MethodGet {
 			return "control:read"
 		}
@@ -465,38 +467,21 @@ func (a *API) createRetryPolicy(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 404, "PROJECT_NOT_FOUND", "Project not found", false)
 		return
 	}
-	patch := controlplane.Patch{
-		"name":                   json.RawMessage(fmt.Sprintf("%q", req.Name)),
-		"max_attempts":           json.RawMessage(fmt.Sprint(req.MaxAttempts)),
-		"strategy":               json.RawMessage(fmt.Sprintf("%q", req.Strategy)),
-		"initial_delay_ms":       json.RawMessage(fmt.Sprint(req.InitialDelayMS)),
-		"multiplier":             json.RawMessage(fmt.Sprint(req.Multiplier)),
-		"max_delay_ms":           json.RawMessage(fmt.Sprint(req.MaxDelayMS)),
-		"jitter_pct":             json.RawMessage(fmt.Sprint(req.JitterPct)),
-		"retry_timeout":          json.RawMessage(fmt.Sprint(req.RetryTimeout)),
-		"retry_rate_limited":     json.RawMessage(fmt.Sprint(req.RetryRateLimited)),
-		"retry_dependency_error": json.RawMessage(fmt.Sprint(req.RetryDependencyError)),
-		"retry_validation_error": json.RawMessage(fmt.Sprint(req.RetryValidationError)),
-	}
-	if err := controlplane.ValidatePatch("retry_policy", patch); err != nil {
-		problem(w, r, 400, "INVALID_RETRY_POLICY", err.Error(), false)
-		return
-	}
-	if err := controlplane.ValidateRetryPolicyValues(req.Strategy, req.InitialDelayMS, req.MaxDelayMS, req.Multiplier); err != nil {
-		problem(w, r, 400, "INVALID_RETRY_POLICY", err.Error(), false)
-		return
-	}
-	var id uuid.UUID
-	var version int64
-	err := a.Store.Pool.QueryRow(r.Context(), "INSERT INTO retry_policies(project_id,name,max_attempts,strategy,initial_delay_ms,multiplier,max_delay_ms,jitter_pct,retry_timeout,retry_rate_limited,retry_dependency_error,retry_validation_error) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) RETURNING id,row_version", req.ProjectID, req.Name, req.MaxAttempts, req.Strategy, req.InitialDelayMS, req.Multiplier, req.MaxDelayMS, req.JitterPct, req.RetryTimeout, req.RetryRateLimited, req.RetryDependencyError, req.RetryValidationError).Scan(&id, &version)
+	out, err := (controlplane.PolicyService{Store: a.Store}).CreateRetry(r.Context(), controlplane.RetryPolicyInput{ProjectID: req.ProjectID, Name: req.Name, MaxAttempts: req.MaxAttempts, Strategy: req.Strategy, InitialDelayMS: req.InitialDelayMS, Multiplier: req.Multiplier, MaxDelayMS: req.MaxDelayMS, JitterPct: req.JitterPct, RetryTimeout: req.RetryTimeout, RetryRateLimited: req.RetryRateLimited, RetryDependencyError: req.RetryDependencyError, RetryValidationError: req.RetryValidationError}, func(ctx context.Context, tx pgx.Tx, id uuid.UUID) error {
+		return a.auditChangeTx(ctx, tx, principal(r), req.ProjectID, "retry_policy.create", "retry_policy", id, nil, req)
+	})
 	if err != nil {
-		handleErr(w, r, err)
+		var databaseError *pgconn.PgError
+		if errors.As(err, &databaseError) {
+			handleErr(w, r, err)
+			return
+		}
+		problem(w, r, 400, "INVALID_RETRY_POLICY", err.Error(), false)
 		return
 	}
-	a.audit(r.Context(), principal(r), req.ProjectID, "retry_policy.create", "retry_policy", id, req)
-	a.emit(r.Context(), req.ProjectID, "retry_policy.changed", "retry_policy", id, map[string]any{"id": id, "version": version})
-	w.Header().Set("ETag", strconv.Quote(strconv.FormatInt(version, 10)))
-	writeJSON(w, 201, map[string]any{"id": id, "status": "ACTIVE", "version": version})
+	a.emit(r.Context(), req.ProjectID, "retry_policy.changed", "retry_policy", out.ID, map[string]any{"id": out.ID, "version": out.Version})
+	w.Header().Set("ETag", strconv.Quote(strconv.FormatInt(out.Version, 10)))
+	writeJSON(w, 201, map[string]any{"id": out.ID, "status": out.Status, "version": out.Version})
 }
 
 func (a *API) createRateLimitPolicy(w http.ResponseWriter, r *http.Request) {
@@ -520,65 +505,21 @@ func (a *API) createRateLimitPolicy(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 404, "PROJECT_NOT_FOUND", "Project not found", false)
 		return
 	}
-	if strings.TrimSpace(req.Name) == "" || req.Capacity < 1 || req.RefillTokens < 1 || req.RefillPeriodMS < 1 || req.RefillPeriodMS > 86400000 {
-		problem(w, r, 400, "INVALID_RATE_LIMIT", "name, capacity, refill_tokens and refill_period_ms are invalid", false)
-		return
-	}
-	if req.Scope != "PROJECT" && req.Scope != "QUEUE" && req.Scope != "FUNCTION" {
-		problem(w, r, 400, "INVALID_RATE_LIMIT_SCOPE", "scope must be PROJECT, QUEUE or FUNCTION", false)
-		return
-	}
-	if req.EnforcementPoint == "" {
-		req.EnforcementPoint = "WORKER_START"
-	}
-	if req.EnforcementPoint != "SUBMISSION" && req.EnforcementPoint != "WORKER_START" {
-		problem(w, r, 400, "INVALID_RATE_LIMIT_ENFORCEMENT", "enforcement_point must be SUBMISSION or WORKER_START", false)
-		return
-	}
-	if (req.Scope == "PROJECT") != (req.TargetID == nil) {
-		problem(w, r, 400, "INVALID_RATE_LIMIT_TARGET", "PROJECT has no target; QUEUE/FUNCTION require target_id", false)
-		return
-	}
-	if req.TargetID != nil {
-		var exists bool
-		table := "queues"
-		if req.Scope == "FUNCTION" {
-			table = "function_definitions"
-		}
-		err := a.Store.Pool.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM "+table+" WHERE id=$1 AND project_id=$2 AND deleted_at IS NULL)", *req.TargetID, req.ProjectID).Scan(&exists)
-		if err != nil || !exists {
-			problem(w, r, 404, "RATE_LIMIT_TARGET_NOT_FOUND", "Rate-limit target is not active in this project", false)
+	out, err := (controlplane.PolicyService{Store: a.Store}).CreateRateLimit(r.Context(), controlplane.RateLimitPolicyInput{ProjectID: req.ProjectID, Name: req.Name, Scope: req.Scope, TargetID: req.TargetID, Capacity: req.Capacity, RefillTokens: req.RefillTokens, RefillPeriodMS: req.RefillPeriodMS, EnforcementPoint: req.EnforcementPoint}, func(ctx context.Context, tx pgx.Tx, id uuid.UUID) error {
+		return a.auditChangeTx(ctx, tx, principal(r), req.ProjectID, "rate_limit_policy.create", "rate_limit_policy", id, nil, req)
+	})
+	if err != nil {
+		var databaseError *pgconn.PgError
+		if errors.As(err, &databaseError) {
+			handleErr(w, r, err)
 			return
 		}
-	}
-	tx, err := a.Store.Pool.Begin(r.Context())
-	if err != nil {
-		handleErr(w, r, err)
+		problem(w, r, 400, "INVALID_RATE_LIMIT", err.Error(), false)
 		return
 	}
-	defer tx.Rollback(r.Context())
-	var id uuid.UUID
-	var version int64
-	err = tx.QueryRow(r.Context(), "INSERT INTO rate_limit_policies(project_id,name,scope,target_id,capacity,refill_tokens,refill_period_ms,enforcement_point) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,row_version", req.ProjectID, req.Name, req.Scope, req.TargetID, req.Capacity, req.RefillTokens, req.RefillPeriodMS, req.EnforcementPoint).Scan(&id, &version)
-	if err != nil {
-		handleErr(w, r, err)
-		return
-	}
-	if _, err = tx.Exec(r.Context(), "INSERT INTO rate_limit_buckets(policy_id,tokens) VALUES($1,$2)", id, req.Capacity); err != nil {
-		handleErr(w, r, err)
-		return
-	}
-	if err = a.auditChangeTx(r.Context(), tx, principal(r), req.ProjectID, "rate_limit_policy.create", "rate_limit_policy", id, nil, req); err != nil {
-		handleErr(w, r, err)
-		return
-	}
-	if err = tx.Commit(r.Context()); err != nil {
-		handleErr(w, r, err)
-		return
-	}
-	a.emit(r.Context(), req.ProjectID, "rate_limit_policy.changed", "rate_limit_policy", id, map[string]any{"id": id, "version": version})
-	w.Header().Set("ETag", strconv.Quote(strconv.FormatInt(version, 10)))
-	writeJSON(w, 201, map[string]any{"id": id, "version": version, "status": "ACTIVE"})
+	a.emit(r.Context(), req.ProjectID, "rate_limit_policy.changed", "rate_limit_policy", out.ID, map[string]any{"id": out.ID, "version": out.Version})
+	w.Header().Set("ETag", strconv.Quote(strconv.FormatInt(out.Version, 10)))
+	writeJSON(w, 201, map[string]any{"id": out.ID, "version": out.Version, "status": out.Status})
 }
 
 func (a *API) createFunctionDefinition(w http.ResponseWriter, r *http.Request) {
@@ -598,25 +539,21 @@ func (a *API) createFunctionDefinition(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 404, "PROJECT_NOT_FOUND", "Project not found", false)
 		return
 	}
-	if req.FunctionKey == "" || req.Version == "" {
-		problem(w, r, 400, "INVALID_FUNCTION", "function_key and version are required", false)
-		return
-	}
-	if len(req.InputSchema) == 0 {
-		req.InputSchema = json.RawMessage(`{}`)
-	}
-	if err := postgres.ValidateInputSchema(req.InputSchema); err != nil {
-		problem(w, r, 400, "INVALID_INPUT_SCHEMA", err.Error(), false)
-		return
-	}
-	var id uuid.UUID
-	err := a.Store.Pool.QueryRow(r.Context(), "INSERT INTO function_definitions(project_id,function_key,version,input_schema) VALUES($1,$2,$3,$4) RETURNING id", req.ProjectID, req.FunctionKey, req.Version, req.InputSchema).Scan(&id)
+	out, err := (controlplane.DefinitionService{Store: a.Store}).CreateFunction(r.Context(), controlplane.FunctionDefinitionInput{ProjectID: req.ProjectID, FunctionKey: req.FunctionKey, Version: req.Version, InputSchema: req.InputSchema}, func(ctx context.Context, tx pgx.Tx, id uuid.UUID) error {
+		return a.auditChangeTx(ctx, tx, principal(r), req.ProjectID, "function.create", "function_definition", id, nil, req)
+	})
 	if err != nil {
-		handleErr(w, r, err)
+		var databaseError *pgconn.PgError
+		if errors.As(err, &databaseError) {
+			handleErr(w, r, err)
+			return
+		}
+		problem(w, r, 400, "INVALID_FUNCTION", err.Error(), false)
 		return
 	}
-	a.audit(r.Context(), principal(r), req.ProjectID, "function.create", "function_definition", id, req)
-	writeJSON(w, 201, map[string]any{"id": id, "status": "ACTIVE"})
+	a.emit(r.Context(), req.ProjectID, "function_definition.changed", "function_definition", out.ID, map[string]any{"id": out.ID, "version": out.Version})
+	w.Header().Set("ETag", strconv.Quote(strconv.FormatInt(out.Version, 10)))
+	writeJSON(w, 201, map[string]any{"id": out.ID, "status": out.Status, "version": out.Version})
 }
 
 func (a *API) createJobDefinition(w http.ResponseWriter, r *http.Request) {
@@ -642,46 +579,25 @@ func (a *API) createJobDefinition(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 404, "PROJECT_NOT_FOUND", "Project not found", false)
 		return
 	}
-	if req.Name == "" {
-		problem(w, r, 400, "INVALID_JOB_DEFINITION", "name is required", false)
-		return
-	}
-	if req.DefaultPriority == 0 {
-		req.DefaultPriority = 3
-	}
-	if req.TimeoutMS == 0 {
-		req.TimeoutMS = 30000
-	}
-	if req.ExecutionMode == "" {
-		req.ExecutionMode = "SINGLE"
-	}
-	if req.ExecutionMode != "SINGLE" && req.ExecutionMode != "BATCH" {
-		problem(w, r, 400, "INVALID_EXECUTION_MODE", "execution_mode must be SINGLE or BATCH", false)
-		return
-	}
-	if req.BatchSize == 0 {
-		req.BatchSize = 100
-	}
-	if req.BatchSize < 2 || req.BatchSize > 1000 {
-		problem(w, r, 400, "INVALID_BATCH_SIZE", "batch_size must be between 2 and 1000", false)
-		return
-	}
-	if req.BatchMaxWaitMS < 0 || req.BatchMaxWaitMS > 3600000 {
-		problem(w, r, 400, "INVALID_BATCH_WAIT", "batch_max_wait_ms must be 0..3600000", false)
-		return
-	}
-	var id uuid.UUID
-	err := a.Store.Pool.QueryRow(r.Context(), `INSERT INTO job_definitions(project_id,function_id,queue_id,retry_policy_id,name,default_priority,timeout_ms,execution_mode,batch_size,batch_max_wait_ms) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10 WHERE EXISTS(SELECT 1 FROM function_definitions WHERE id=$2 AND project_id=$1 AND deleted_at IS NULL FOR UPDATE) AND EXISTS(SELECT 1 FROM queues WHERE id=$3 AND project_id=$1 AND deleted_at IS NULL FOR UPDATE) AND ($4::uuid IS NULL OR EXISTS(SELECT 1 FROM retry_policies WHERE id=$4 AND project_id=$1 AND deleted_at IS NULL FOR UPDATE)) AND ($8 <> 'BATCH' OR NOT EXISTS(SELECT 1 FROM queues q JOIN queue_backends qb ON qb.id=q.backend_id WHERE q.id=$3 AND qb.backend_type <> 'POSTGRES')) RETURNING id`, req.ProjectID, req.FunctionID, req.QueueID, req.RetryPolicyID, req.Name, req.DefaultPriority, req.TimeoutMS, req.ExecutionMode, req.BatchSize, req.BatchMaxWaitMS).Scan(&id)
-	if errors.Is(err, pgx.ErrNoRows) {
-		problem(w, r, 404, "DEPENDENCY_NOT_FOUND", "Function, queue or retry policy is outside this project", false)
+	out, err := (controlplane.DefinitionService{Store: a.Store}).CreateJob(r.Context(), controlplane.JobDefinitionInput{ProjectID: req.ProjectID, FunctionID: req.FunctionID, QueueID: req.QueueID, RetryPolicyID: req.RetryPolicyID, Name: req.Name, DefaultPriority: req.DefaultPriority, TimeoutMS: req.TimeoutMS, ExecutionMode: req.ExecutionMode, BatchSize: req.BatchSize, BatchMaxWaitMS: req.BatchMaxWaitMS}, func(ctx context.Context, tx pgx.Tx, id uuid.UUID) error {
+		return a.auditChangeTx(ctx, tx, principal(r), req.ProjectID, "job_definition.create", "job_definition", id, nil, req)
+	})
+	if errors.Is(err, controlplane.ErrDependencyNotFound) {
+		problem(w, r, 404, "DEPENDENCY_NOT_FOUND", "Function, queue or retry policy is outside this project, inactive, or the selected queue cannot run BATCH externally", false)
 		return
 	}
 	if err != nil {
-		handleErr(w, r, err)
+		var databaseError *pgconn.PgError
+		if errors.As(err, &databaseError) {
+			handleErr(w, r, err)
+			return
+		}
+		problem(w, r, 400, "INVALID_JOB_DEFINITION", err.Error(), false)
 		return
 	}
-	a.audit(r.Context(), principal(r), req.ProjectID, "job_definition.create", "job_definition", id, req)
-	writeJSON(w, 201, map[string]any{"id": id, "status": "ACTIVE"})
+	a.emit(r.Context(), req.ProjectID, "job_definition.changed", "job_definition", out.ID, map[string]any{"id": out.ID, "version": out.Version})
+	w.Header().Set("ETag", strconv.Quote(strconv.FormatInt(out.Version, 10)))
+	writeJSON(w, 201, map[string]any{"id": out.ID, "status": out.Status, "version": out.Version})
 }
 
 func (a *API) runNow(w http.ResponseWriter, r *http.Request) {

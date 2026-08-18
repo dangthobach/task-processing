@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"github.com/example/task-processing/internal/audit"
 	"github.com/example/task-processing/internal/domain/job"
 	"github.com/example/task-processing/internal/persistence/postgres"
 	"github.com/example/task-processing/internal/queuebackend"
@@ -56,6 +57,10 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+	auditSink, err := audit.FromEnv()
+	if err != nil {
+		panic(err)
+	}
 	reg := registry.New()
 	reg.Register("example.echo", func(e *job.ExecutionContext) error {
 		slog.Info("echo handled", "run_id", e.Execution.RunID, "payload", string(e.Execution.Payload))
@@ -76,7 +81,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	w := &worker.Worker{Store: store, Registry: reg, ID: workerID, Owner: id.String(), Config: config, Backends: backends, Log: slog.Default()}
+	w := &worker.Worker{Store: store, Registry: reg, ID: workerID, Owner: id.String(), Config: config, Backends: backends, AuditSink: auditSink, Log: slog.Default()}
 	if err = w.Run(ctx); err != nil && ctx.Err() == nil {
 		panic(err)
 	}

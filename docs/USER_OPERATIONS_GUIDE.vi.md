@@ -224,3 +224,32 @@ Nếu run kẹt `ENQUEUE_PENDING`, kiểm tra worker đang chạy và `task_outb
 - Không sửa trực tiếp `job_runs`/`job_attempts` để vận hành thường ngày; dùng API cancel/retry/DLQ replay để giữ audit/outbox/fencing đúng.
 - Không đăng ký Function key chưa có handler trong worker.
 - Dùng idempotency key cho mọi submit có side effect bên ngoài.
+# Bổ sung Control Plane và vận hành production
+
+## Picker, schema, cron và workflow
+
+- Tại **Create**, các quan hệ Function, Queue, Retry Policy và Job Definition dùng picker. Chọn theo tên rồi kiểm tra ID rút gọn; không cần tự chép UUID.
+- **Input JSON Schema** là schema JSON Schema của payload. Nhấn Register function chỉ khi JSON hợp lệ; API vẫn validate schema khi submit để không thể bypass UI.
+- **Schedule job** có `Preview next 5`. Kết quả được backend tính bằng cùng parser với Schedule Planner. Bật `Six-field cron` nếu biểu thức có giây.
+- **Workflow DAG designer**: thêm step, gán Job Definition cho từng step, sau đó `Connect steps`. Step key phải duy nhất. Backend kiểm tra node thiếu, self-edge và cycle trước khi ghi transaction.
+
+## Retention, audit và SLO
+
+- Form **Retention & partitions** tạo policy theo resource. Sửa, disable, soft-delete hoặc restore ở Control Plane → Retention. Worker xóa theo chunk nên không giữ transaction lớn.
+- Alert rules ở `deploy/prometheus/task-processing-alerts.yml`; import `deploy/grafana/task-processing-dashboard.json` vào Grafana. SLO vận hành khuyến nghị: queue oldest age < 300s, heartbeat age < 30s và audit sink failures = 0 trong 15 phút.
+- Set `TASK_AUDIT_SINK_URL` (và tùy chọn `TASK_AUDIT_SINK_TOKEN`) trên worker để forward audit event. Sink nhận `X-Audit-Event-ID` và phải deduplicate theo ID; delivery là at-least-once với lease/backoff, tối đa 20 lần rồi expiry rõ ràng trong outbox.
+
+## Vault Transit và key rotation
+
+Sử dụng `TASK_KMS_PROVIDER=vault`, `TASK_VAULT_ADDR`, `TASK_VAULT_TOKEN`, `TASK_VAULT_TRANSIT_KEY`; tùy chọn `TASK_VAULT_TRANSIT_MOUNT` (mặc định `transit`) và `TASK_VAULT_NAMESPACE`. Provider có deadline 10 giây; lỗi KMS trả về lỗi nghiệp vụ, không làm treo worker loop.
+
+Sau khi Vault rotate key, chạy chiến dịch bounded:
+
+```powershell
+$env:DATABASE_URL='postgres://task:task@localhost:5432/task_processing?sslmode=disable'
+$env:KMS_ROTATE_RESET='true' # chỉ một lần, bắt đầu campaign mới
+$env:KMS_ROTATE_LIMIT='100'
+go run ./cmd/kms-rotate
+```
+
+Sau đó bỏ `KMS_ROTATE_RESET` và lặp lệnh cho tới khi output là `rewrapped 0`. Cả payload job và cấu hình encrypted backend đều dùng conditional write, nên cập nhật cạnh tranh không bị ghi đè.

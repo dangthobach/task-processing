@@ -1,0 +1,16 @@
+{
+  "title": "Task Processing / Production",
+  "schemaVersion": 39,
+  "refresh": "30s",
+  "time": {"from": "now-6h", "to": "now"},
+  "panels": [
+    {"type":"stat","title":"Inflight work","targets":[{"expr":"sum(task_worker_inflight)"}],"gridPos":{"x":0,"y":0,"w":6,"h":4}},
+    {"type":"stat","title":"Completion rate (5m)","targets":[{"expr":"sum(rate(task_runs_completed_total[5m]))"}],"gridPos":{"x":6,"y":0,"w":6,"h":4}},
+    {"type":"stat","title":"Outbox failures (15m)","targets":[{"expr":"sum(increase(task_outbox_failures_total[15m]))"}],"gridPos":{"x":12,"y":0,"w":6,"h":4}},
+    {"type":"stat","title":"Audit sink failures (15m)","targets":[{"expr":"sum(increase(task_audit_sink_failures_total[15m]))"}],"gridPos":{"x":18,"y":0,"w":6,"h":4}},
+    {"type":"timeseries","title":"Queue latency SLO","targets":[{"expr":"max by(queue) (task_queue_oldest_age_seconds)"}],"fieldConfig":{"defaults":{"unit":"s"}},"gridPos":{"x":0,"y":4,"w":12,"h":8}},
+    {"type":"timeseries","title":"Worker heartbeat age","targets":[{"expr":"max by(worker) (task_worker_heartbeat_age_seconds)"}],"fieldConfig":{"defaults":{"unit":"s"}},"gridPos":{"x":12,"y":4,"w":12,"h":8}},
+    {"type":"timeseries","title":"Terminal outcomes","targets":[{"expr":"sum by(status,error_class) (rate(task_runs_completed_total[5m]))"}],"gridPos":{"x":0,"y":12,"w":12,"h":8}},
+    {"type":"timeseries","title":"Retention throughput","targets":[{"expr":"sum(rate(task_retention_rows_deleted_total[5m]))"}],"gridPos":{"x":12,"y":12,"w":12,"h":8}}
+  ]
+}

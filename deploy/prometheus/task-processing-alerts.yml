@@ -21,3 +21,8 @@ groups:
         for: 5m
         labels: {severity: warning}
         annotations: {summary: "Task worker maintenance/reconciliation is failing"}
+      - alert: TaskAuditSinkUnavailable
+        expr: increase(task_audit_sink_failures_total[15m]) > 3
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "External audit sink is failing; durable retries are pending"}

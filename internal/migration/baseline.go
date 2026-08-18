@@ -34,6 +34,8 @@ var baselineRequirements = []baselineRequirement{
 	{11, "users", "subject", ""}, {11, "roles", "role_key", ""}, {11, "permissions", "permission_key", ""},
 	{12, "rate_limit_policies", "scope", ""}, {12, "rate_limit_buckets", "tokens", ""},
 	{12, "", "", "ux_rate_limit_active_name"},
+	{21, "audit_outbox_events", "claim_token", ""},
+	{22, "job_runs", "payload_rewrapped_at", ""},
 }
 
 // VerifyBaseline validates the minimum relational fingerprint for an existing

@@ -23,6 +23,7 @@ var allowed = map[string]map[string]struct{}{
 	"function_definition": {"input_schema": {}, "status": {}},
 	"job_definition":      {"name": {}, "retry_policy_id": {}, "default_priority": {}, "timeout_ms": {}, "execution_mode": {}, "batch_size": {}, "batch_max_wait_ms": {}, "status": {}},
 	"schedule":            {"cron_expression": {}, "timezone": {}, "with_seconds": {}, "run_at": {}, "status": {}},
+	"retention_policy":    {"retention_days": {}, "status": {}},
 }
 
 func ValidatePatch(resource string, patch Patch) error {
@@ -143,6 +144,10 @@ func ValidatePatch(resource string, patch Patch) error {
 				return fmt.Errorf("run_at must be RFC3339")
 			}
 		}
+	}
+	if resource == "retention_policy" {
+		if err := positiveInt(patch, "retention_days", 1, 3650); err != nil { return err }
+		return enum(patch, "status", "ACTIVE", "DISABLED")
 	}
 	return nil
 }

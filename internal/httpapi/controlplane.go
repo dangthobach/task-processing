@@ -31,6 +31,7 @@ var controlSpecs = map[string]controlSpec{
 	"function-definitions": {resource: "function_definition", table: "function_definitions", role: []string{"admin", "developer"}, scope: "t.project_id=$1", event: "function_definition.changed"},
 	"job-definitions":      {resource: "job_definition", table: "job_definitions", role: []string{"admin", "developer"}, scope: "t.project_id=$1", event: "job_definition.changed"},
 	"schedules":            {resource: "schedule", table: "schedules", role: []string{"admin", "developer"}, scope: "EXISTS(SELECT 1 FROM job_definitions jd WHERE jd.id=t.job_definition_id AND jd.project_id=$1)", event: "schedule.changed"},
+	"retention-policies":   {resource: "retention_policy", table: "retention_policies", role: []string{"admin", "developer"}, scope: "t.project_id=$1", event: "retention_policy.changed"},
 }
 
 func controlSpecFor(r *http.Request) (controlSpec, bool) {

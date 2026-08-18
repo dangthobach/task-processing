@@ -70,6 +70,33 @@ type Delivery struct {
 	Receipt string `json:"-"`
 }
 
+// BatchReserveRequest is a protocol extension, separate from Reserve so an
+// adapter cannot accidentally claim a BATCH definition as independent jobs.
+// A conforming adapter must atomically reserve every message in a delivery and
+// retain receipts until PostgreSQL persists every item result.
+type BatchReserveRequest struct {
+	ReserveRequest
+	QueueID        uuid.UUID
+	MaxItems       int
+	MaxWait        time.Duration
+	BatchGeneration uuid.UUID
+}
+type BatchDelivery struct {
+	Messages   []Message
+	Receipts   []string
+	Generation uuid.UUID
+}
+
+// BatchBackend is deliberately optional. Redis Streams and JetStream remain
+// ineligible for BATCH execution until their adapter implements this contract
+// and its acknowledgement/lease integration tests. This is a safety gate, not
+// a capability flag that can be toggled by configuration.
+type BatchBackend interface {
+	ReserveBatch(context.Context, BatchReserveRequest) ([]BatchDelivery, error)
+	AckBatch(context.Context, BatchDelivery) error
+	NackBatch(context.Context, BatchDelivery, error) error
+}
+
 type QueueStats struct {
 	Queued  int64      `json:"queued"`
 	Running int64      `json:"running"`
