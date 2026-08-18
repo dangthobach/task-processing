@@ -49,6 +49,7 @@ type ClaimedOutboxMessage struct {
 	Token       uuid.UUID
 	DispatchID  uuid.UUID
 	BackendType string
+	BackendID   *uuid.UUID
 	RunID       uuid.UUID
 	ProjectID   uuid.UUID
 	QueueID     uuid.UUID
@@ -85,7 +86,7 @@ func (s *Store) ClaimOutbox(ctx context.Context, owner string, limit int, lease 
 	SET claimed_by=$1,claim_token=gen_random_uuid(),claim_expires_at=now()+($2 * interval '1 millisecond')
 	FROM picked p, job_runs r JOIN queues q ON q.id=r.queue_id LEFT JOIN queue_backends b ON b.id=q.backend_id
 	WHERE o.id=p.id AND r.id=o.aggregate_id AND o.dispatch_id=r.current_dispatch_id
-	RETURNING o.id,o.claim_token,o.dispatch_id,COALESCE(b.backend_type,'POSTGRES'),r.id,r.project_id,r.queue_id,r.priority,r.available_at`, owner, lease.Milliseconds(), limit)
+	RETURNING o.id,o.claim_token,o.dispatch_id,COALESCE(b.backend_type,'POSTGRES'),b.id,r.id,r.project_id,r.queue_id,r.priority,r.available_at`, owner, lease.Milliseconds(), limit)
 	if err != nil {
 		return nil, err
 	}
@@ -93,7 +94,7 @@ func (s *Store) ClaimOutbox(ctx context.Context, owner string, limit int, lease 
 	items := []ClaimedOutboxMessage{}
 	for rows.Next() {
 		var item ClaimedOutboxMessage
-		if err = rows.Scan(&item.ID, &item.Token, &item.DispatchID, &item.BackendType, &item.RunID, &item.ProjectID, &item.QueueID, &item.Priority, &item.AvailableAt); err != nil {
+		if err = rows.Scan(&item.ID, &item.Token, &item.DispatchID, &item.BackendType, &item.BackendID, &item.RunID, &item.ProjectID, &item.QueueID, &item.Priority, &item.AvailableAt); err != nil {
 			return nil, err
 		}
 		items = append(items, item)
@@ -282,11 +283,10 @@ func (s *Store) Claim(ctx context.Context, workerID uuid.UUID, owner string, lim
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `WITH picked AS (SELECT r.id FROM job_runs r JOIN queues q ON q.id=r.queue_id JOIN job_definitions jd ON jd.id=r.job_definition_id WHERE r.status='QUEUED' AND r.available_at<=now() AND q.status='ACTIVE' AND q.deleted_at IS NULL AND jd.deleted_at IS NULL AND jd.execution_mode='SINGLE' ORDER BY r.priority DESC,r.available_at ASC,r.id ASC FOR UPDATE SKIP LOCKED LIMIT $1) UPDATE job_runs r SET status='RESERVED',lease_owner=$2,lease_token=gen_random_uuid(),lease_expires_at=now()+($3 * interval '1 millisecond'),reserved_at=now(),updated_at=now() FROM picked WHERE r.id=picked.id RETURNING r.id,r.project_id,r.job_definition_id,r.queue_id,r.idempotency_key,r.priority,r.payload,r.function_version,r.policy_snapshot,r.lease_token,r.current_dispatch_id`, limit, owner, lease.Milliseconds())
+	rows, err := tx.Query(ctx, `WITH picked AS (SELECT r.id FROM job_runs r JOIN queues q ON q.id=r.queue_id LEFT JOIN queue_backends qb ON qb.id=q.backend_id JOIN job_definitions jd ON jd.id=r.job_definition_id WHERE r.status='QUEUED' AND r.available_at<=now() AND q.status='ACTIVE' AND q.deleted_at IS NULL AND jd.deleted_at IS NULL AND jd.execution_mode='SINGLE' AND (q.backend_id IS NULL OR (qb.backend_type='POSTGRES' AND qb.status='ACTIVE' AND qb.deleted_at IS NULL)) ORDER BY r.priority DESC,r.available_at ASC,r.id ASC FOR UPDATE OF r SKIP LOCKED LIMIT $1) UPDATE job_runs r SET status='RESERVED',lease_owner=$2,lease_token=gen_random_uuid(),lease_expires_at=now()+($3 * interval '1 millisecond'),reserved_at=now(),updated_at=now() FROM picked WHERE r.id=picked.id RETURNING r.id,r.project_id,r.job_definition_id,r.queue_id,r.idempotency_key,r.priority,r.payload,r.function_version,r.policy_snapshot,r.lease_token,r.current_dispatch_id`, limit, owner, lease.Milliseconds())
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var result []job.Run
 	for rows.Next() {
 		var r job.Run
@@ -297,14 +297,18 @@ func (s *Store) Claim(ctx context.Context, workerID uuid.UUID, owner string, lim
 		if err = json.Unmarshal(policy, &r.Policy); err != nil {
 			return nil, err
 		}
-		if err = tx.QueryRow(ctx, `SELECT fd.function_key FROM job_definitions jd JOIN function_definitions fd ON fd.id=jd.function_id WHERE jd.id=$1 AND jd.deleted_at IS NULL AND fd.deleted_at IS NULL`, r.DefinitionID).Scan(&r.FunctionKey); err != nil {
-			return nil, err
-		}
 		r.Status = job.Reserved
 		result = append(result, r)
 	}
 	if err = rows.Err(); err != nil {
+		rows.Close()
 		return nil, err
+	}
+	rows.Close()
+	for index := range result {
+		if err = tx.QueryRow(ctx, `SELECT fd.function_key FROM job_definitions jd JOIN function_definitions fd ON fd.id=jd.function_id WHERE jd.id=$1 AND jd.deleted_at IS NULL AND fd.deleted_at IS NULL`, result[index].DefinitionID).Scan(&result[index].FunctionKey); err != nil {
+			return nil, err
+		}
 	}
 	return result, tx.Commit(ctx)
 }
@@ -327,7 +331,7 @@ func (s *Store) StartAttempt(ctx context.Context, runID, workerID uuid.UUID, own
 		}
 		return job.Execution{}, err
 	}
-	if allowed, rateErr := s.takeRateLimits(ctx, tx, r.ProjectID, r.QueueID, r.DefinitionID); rateErr != nil {
+	if allowed, rateErr := s.takeRateLimits(ctx, tx, r.ProjectID, r.QueueID, r.DefinitionID, "WORKER_START"); rateErr != nil {
 		return job.Execution{}, rateErr
 	} else if !allowed {
 		return job.Execution{}, ErrRateLimited
@@ -391,7 +395,7 @@ func (s *Store) StartAttempt(ctx context.Context, runID, workerID uuid.UUID, own
 	if err != nil {
 		return job.Execution{}, err
 	}
-	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,'job.started','job_run',$2,jsonb_build_object('attempt_id',$3,'attempt_number',$4))", r.ProjectID, runID, attemptID, n)
+	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,'job.started','job_run',$2,jsonb_build_object('attempt_id',$3::uuid,'attempt_number',$4::integer))", r.ProjectID, runID, attemptID, n)
 	if err != nil {
 		return job.Execution{}, err
 	}
@@ -401,8 +405,8 @@ func (s *Store) StartAttempt(ctx context.Context, runID, workerID uuid.UUID, own
 	return job.Execution{RunID: runID, AttemptID: attemptID, TenantID: tenantID, ProjectID: r.ProjectID, QueueID: r.QueueID, DefinitionID: r.DefinitionID, FunctionKey: r.FunctionKey, FunctionVersion: r.FunctionVersion, IdempotencyKey: r.IdempotencyKey, Payload: r.Payload, Policy: r.Policy, Attempt: n, LeaseToken: token, LeaseExpiresAt: leaseExpiresAt}, nil
 }
 
-func (s *Store) takeRateLimits(ctx context.Context, tx pgx.Tx, project, queue, definition uuid.UUID) (bool, error) {
-	rows, err := tx.Query(ctx, "SELECT p.id,p.capacity,p.refill_tokens,p.refill_period_ms,b.tokens,b.last_refilled_at FROM rate_limit_policies p JOIN rate_limit_buckets b ON b.policy_id=p.id WHERE p.project_id=$1 AND p.status='ACTIVE' AND p.deleted_at IS NULL AND (p.scope='PROJECT' OR (p.scope='QUEUE' AND p.target_id=$2) OR (p.scope='FUNCTION' AND p.target_id=(SELECT function_id FROM job_definitions WHERE id=$3))) ORDER BY p.id FOR UPDATE OF p,b", project, queue, definition)
+func (s *Store) takeRateLimits(ctx context.Context, tx pgx.Tx, project, queue, definition uuid.UUID, point string) (bool, error) {
+	rows, err := tx.Query(ctx, "SELECT p.id,p.capacity,p.refill_tokens,p.refill_period_ms,b.tokens,b.last_refilled_at FROM rate_limit_policies p JOIN rate_limit_buckets b ON b.policy_id=p.id WHERE p.project_id=$1 AND p.status='ACTIVE' AND p.deleted_at IS NULL AND p.enforcement_point=$4 AND (p.scope='PROJECT' OR (p.scope='QUEUE' AND p.target_id=$2) OR (p.scope='FUNCTION' AND p.target_id=(SELECT function_id FROM job_definitions WHERE id=$3))) ORDER BY p.id FOR UPDATE OF p,b", project, queue, definition, point)
 	if err != nil {
 		return false, err
 	}
@@ -425,11 +429,14 @@ func (s *Store) takeRateLimits(ctx context.Context, tx pgx.Tx, project, queue, d
 	if err = rows.Err(); err != nil {
 		return false, err
 	}
-	now := time.Now()
+	var now time.Time
+	if err = tx.QueryRow(ctx, "SELECT clock_timestamp()").Scan(&now); err != nil {
+		return false, err
+	}
 	for _, item := range items {
-		elapsed := now.Sub(item.at).Milliseconds()
+		elapsed := float64(now.Sub(item.at)) / float64(time.Millisecond)
 		if elapsed > 0 {
-			item.tokens = minFloat(float64(item.capacity), item.tokens+float64(elapsed/item.period*int64(item.refill)))
+			item.tokens = minFloat(float64(item.capacity), item.tokens+elapsed*float64(item.refill)/float64(item.period))
 			if _, err = tx.Exec(ctx, "UPDATE rate_limit_buckets SET tokens=$2,last_refilled_at=$3,updated_at=now() WHERE policy_id=$1", item.id, item.tokens, now); err != nil {
 				return false, err
 			}
@@ -475,8 +482,11 @@ func (s *Store) CompleteSuccess(ctx context.Context, ex job.Execution, owner str
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,'job.succeeded','job_run',$2,jsonb_build_object('attempt_id',$3))", ex.ProjectID, ex.RunID, ex.AttemptID)
+	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,'job.succeeded','job_run',$2,jsonb_build_object('attempt_id',$3::uuid))", ex.ProjectID, ex.RunID, ex.AttemptID)
 	if err != nil {
+		return err
+	}
+	if _, err = advanceWorkflowForJobTx(ctx, tx, ex.RunID, true); err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
@@ -521,6 +531,11 @@ func (s *Store) CompleteFailure(ctx context.Context, ex job.Execution, owner str
 	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,$2,'job_run',$3,jsonb_build_object('attempt_id',$4,'error_class',$5,'available_at',$6))", ex.ProjectID, eventType, ex.RunID, ex.AttemptID, class.Class, available)
 	if err != nil {
 		return err
+	}
+	if !retry {
+		if _, err = advanceWorkflowForJobTx(ctx, tx, ex.RunID, false); err != nil {
+			return err
+		}
 	}
 	return tx.Commit(ctx)
 }

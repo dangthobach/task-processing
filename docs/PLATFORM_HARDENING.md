@@ -4,9 +4,11 @@
 
 HTTP handlers now consume an identity Provider boundary. The bundled
 HeaderProvider is development-only and is enabled only with
-TASK_DEV_HEADER_IDENTITY=true. Production must inject an OIDC/JWT Provider
-which maps verified claims to subject and tenant; permissions are resolved from
-the database on every request, not trusted from a role claim.
+TASK_DEV_HEADER_IDENTITY=true. The included OIDC/JWT provider is enabled with
+`TASK_OIDC_ISSUER` and `TASK_OIDC_AUDIENCE`; it verifies issuer, signature and
+audience, then maps `tenant_id` (or `TASK_OIDC_TENANT_CLAIM`) and `sub` to the
+platform subject. Permissions are resolved from the database on every request,
+not trusted from a role claim.
 
 Migration 011 adds tenant-scoped users and roles, global permission catalogue,
 user_roles and role_permissions. Platform administrators can configure them
@@ -22,21 +24,23 @@ TASK_PAYLOAD_KEY_REF. New job payloads are encrypted with AES-256-GCM; the
 project and job-definition identifiers are authenticated additional data.
 Workers decrypt only after a run is leased. Without a configured provider,
 payloads remain plaintext for local compatibility. A cloud KMS adapter only
-needs to implement the small kms.Protector interface.
+needs to implement the small kms.Protector interface. Queue-backend connection
+configuration uses the same provider, is authenticated to its backend ID, and
+stores its key reference so the worker can refresh adapters by row version.
 
 ## Operations data
 
 Migration 010 adds structured job logs, filtered by run and level through
 GET /api/v1/job-runs/{id}/logs. It also adds Prometheus queue-age, heartbeat
 and outbox-failure metrics, plus starter alert rules in deploy/prometheus.
-Retention policies and a partitioned job-log table are introduced in the same
-migration; scheduling the purge executor is the next operational deployment
-step.
+Retention policies run in bounded worker chunks, configured through
+`WORKER_RETENTION_INTERVAL_SECONDS`, so cleanup cannot hold long transactions
+on the runtime hot path.
 
 ## Workflows
 
 Migration 010 introduces workflow definition, node, edge and runtime tables.
 The workflow package validates topology deterministically and rejects cycles,
-duplicate nodes and dangling edges. Dispatching ready DAG nodes is intentionally
-kept out of the worker claim loop until workflow CRUD and run orchestration are
-exposed as a dedicated API.
+duplicate nodes and dangling edges. Terminal state changes now write a durable
+workflow-dispatch outbox in the same transaction; reconciliation repairs a
+crash window and drains it, so downstream nodes do not become stuck.

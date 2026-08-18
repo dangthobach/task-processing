@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/example/task-processing/internal/domain/job"
 	"github.com/google/uuid"
@@ -34,7 +35,7 @@ func (s *Store) StartWorkflow(ctx context.Context, project, workflowID uuid.UUID
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO workflow_node_runs(workflow_run_id,node_id,node_key,job_definition_id,execution_snapshot,status)
 		SELECT $1,n.id,n.node_key,n.job_definition_id,jsonb_build_object(
-			'definition_id',jd.id,'queue_id',jd.queue_id,'function_key',fd.function_key,'function_version',fd.version,'priority',jd.default_priority,
+			'definition_id',jd.id,'queue_id',jd.queue_id,'function_key',fd.function_key,'function_version',fd.version,'input_schema',fd.input_schema,'priority',jd.default_priority,
 			'policy',jsonb_build_object('retry',jsonb_build_object('max_attempts',COALESCE(rp.max_attempts,1),'strategy',COALESCE(rp.strategy,'FIXED'),'initial_delay_ms',COALESCE(rp.initial_delay_ms,0),'multiplier',COALESCE(rp.multiplier,1),'max_delay_ms',COALESCE(rp.max_delay_ms,0),'jitter_pct',COALESCE(rp.jitter_pct,0),'retry_timeout',COALESCE(rp.retry_timeout,false),'retry_rate_limited',COALESCE(rp.retry_rate_limited,false),'retry_dependency_error',COALESCE(rp.retry_dependency_error,false),'retry_validation_error',COALESCE(rp.retry_validation_error,false)),'timeout_ms',jd.timeout_ms)
 		),'PENDING'
 		FROM workflow_nodes n JOIN job_definitions jd ON jd.id=n.job_definition_id JOIN function_definitions fd ON fd.id=jd.function_id LEFT JOIN retry_policies rp ON rp.id=jd.retry_policy_id
@@ -48,10 +49,20 @@ func (s *Store) StartWorkflow(ctx context.Context, project, workflowID uuid.UUID
 		WHERE e.workflow_id=$2`, run, workflowID); err != nil {
 		return uuid.Nil, err
 	}
+	if err = enqueueWorkflowDispatchTx(ctx, tx, run); err != nil {
+		return uuid.Nil, err
+	}
 	if err = tx.Commit(ctx); err != nil {
 		return uuid.Nil, err
 	}
-	return run, s.DispatchReadyWorkflowNodes(ctx, run)
+	return run, nil
+}
+
+func enqueueWorkflowDispatchTx(ctx context.Context, tx pgx.Tx, workflowRun uuid.UUID) error {
+	_, err := tx.Exec(ctx, `INSERT INTO workflow_dispatch_outbox(workflow_run_id,available_at,lease_owner,lease_token,lease_expires_at,last_error,updated_at)
+		VALUES($1,now(),NULL,NULL,NULL,NULL,now())
+		ON CONFLICT(workflow_run_id) DO UPDATE SET available_at=LEAST(workflow_dispatch_outbox.available_at,EXCLUDED.available_at),lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,last_error=NULL,updated_at=now()`, workflowRun)
+	return err
 }
 
 func (s *Store) DispatchReadyWorkflowNodes(ctx context.Context, run uuid.UUID) error {
@@ -94,6 +105,7 @@ func decodeWorkflowDefinition(snapshot json.RawMessage) (Definition, error) {
 		QueueID      uuid.UUID          `json:"queue_id"`
 		FunctionKey  string             `json:"function_key"`
 		Version      string             `json:"function_version"`
+		InputSchema  json.RawMessage    `json:"input_schema"`
 		Priority     job.Priority       `json:"priority"`
 		Policy       job.PolicySnapshot `json:"policy"`
 	}
@@ -103,37 +115,32 @@ func decodeWorkflowDefinition(snapshot json.RawMessage) (Definition, error) {
 	if raw.DefinitionID == uuid.Nil || raw.QueueID == uuid.Nil || raw.FunctionKey == "" || raw.Version == "" || raw.Priority < job.Bulk || raw.Priority > job.Critical {
 		return Definition{}, fmt.Errorf("workflow execution snapshot is invalid")
 	}
-	return Definition{ID: raw.DefinitionID, QueueID: raw.QueueID, FunctionKey: raw.FunctionKey, FunctionVersion: raw.Version, Priority: raw.Priority, Policy: raw.Policy}, nil
+	return Definition{ID: raw.DefinitionID, QueueID: raw.QueueID, FunctionKey: raw.FunctionKey, FunctionVersion: raw.Version, InputSchema: raw.InputSchema, Priority: raw.Priority, Policy: raw.Policy}, nil
 }
 
-func (s *Store) AdvanceWorkflowForJob(ctx context.Context, runID uuid.UUID, succeeded bool) error {
-	tx, err := s.Pool.Begin(ctx)
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback(ctx)
+func advanceWorkflowForJobTx(ctx context.Context, tx pgx.Tx, runID uuid.UUID, succeeded bool) (uuid.UUID, error) {
 	var nodeRun, workflowRun uuid.UUID
-	err = tx.QueryRow(ctx, "SELECT id,workflow_run_id FROM workflow_node_runs WHERE job_run_id=$1 AND status='RUNNING' FOR UPDATE", runID).Scan(&nodeRun, &workflowRun)
+	err := tx.QueryRow(ctx, "SELECT id,workflow_run_id FROM workflow_node_runs WHERE job_run_id=$1 AND status='RUNNING' FOR UPDATE", runID).Scan(&nodeRun, &workflowRun)
 	if err != nil {
 		if err == pgx.ErrNoRows {
-			return nil
+			return uuid.Nil, nil
 		}
-		return err
+		return uuid.Nil, err
 	}
 	if succeeded {
 		if _, err = tx.Exec(ctx, "UPDATE workflow_node_runs SET status='SUCCEEDED',finished_at=now() WHERE id=$1", nodeRun); err != nil {
-			return err
+			return uuid.Nil, err
 		}
 		var remaining int
 		if err = tx.QueryRow(ctx, "SELECT count(*) FROM workflow_node_runs WHERE workflow_run_id=$1 AND status<>'SUCCEEDED'", workflowRun).Scan(&remaining); err != nil {
-			return err
+			return uuid.Nil, err
 		}
 		if remaining == 0 {
 			_, err = tx.Exec(ctx, "UPDATE workflow_runs SET status='SUCCEEDED',finished_at=now() WHERE id=$1", workflowRun)
 		}
 	} else {
 		if _, err = tx.Exec(ctx, "UPDATE workflow_node_runs SET status='FAILED',finished_at=now() WHERE id=$1", nodeRun); err != nil {
-			return err
+			return uuid.Nil, err
 		}
 		_, err = tx.Exec(ctx, "UPDATE workflow_node_runs SET status='CANCELLED',finished_at=now() WHERE workflow_run_id=$1 AND status='PENDING'", workflowRun)
 		if err == nil {
@@ -141,13 +148,95 @@ func (s *Store) AdvanceWorkflowForJob(ctx context.Context, runID uuid.UUID, succ
 		}
 	}
 	if err != nil {
-		return err
-	}
-	if err = tx.Commit(ctx); err != nil {
-		return err
+		return uuid.Nil, err
 	}
 	if succeeded {
-		return s.DispatchReadyWorkflowNodes(ctx, workflowRun)
+		if err = enqueueWorkflowDispatchTx(ctx, tx, workflowRun); err != nil {
+			return uuid.Nil, err
+		}
 	}
-	return nil
+	return workflowRun, nil
+}
+
+// AdvanceWorkflowForJob is retained for operational callers. Normal terminal
+// completion calls the transactional helper from CompleteSuccess/Failure.
+func (s *Store) AdvanceWorkflowForJob(ctx context.Context, runID uuid.UUID, succeeded bool) error {
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+	_, err = advanceWorkflowForJobTx(ctx, tx, runID, succeeded)
+	if err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
+// ReconcileWorkflowTransitions repairs records left by older releases or a
+// process crash, then drains durable dispatch signals. Submission is safe to
+// repeat because every node has a stable idempotency key.
+func (s *Store) ReconcileWorkflowTransitions(ctx context.Context, owner string, limit int, lease time.Duration) (int, error) {
+	if limit <= 0 {
+		limit = 100
+	}
+	if lease <= 0 {
+		lease = 30 * time.Second
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `SELECT nr.job_run_id, jr.status='SUCCEEDED'
+		FROM workflow_node_runs nr JOIN job_runs jr ON jr.id=nr.job_run_id
+		WHERE nr.status='RUNNING' AND jr.status IN ('SUCCEEDED','DEAD_LETTER','CANCELLED')
+		ORDER BY nr.created_at LIMIT $1 FOR UPDATE OF nr SKIP LOCKED`, limit)
+	if err != nil {
+		return 0, err
+	}
+	for rows.Next() {
+		var id uuid.UUID
+		var succeeded bool
+		if err = rows.Scan(&id, &succeeded); err != nil {
+			rows.Close()
+			return 0, err
+		}
+		if _, err = advanceWorkflowForJobTx(ctx, tx, id, succeeded); err != nil {
+			rows.Close()
+			return 0, err
+		}
+	}
+	if err = rows.Err(); err != nil {
+		rows.Close()
+		return 0, err
+	}
+	rows.Close()
+	if err = tx.Commit(ctx); err != nil {
+		return 0, err
+	}
+
+	rows, err = s.Pool.Query(ctx, `UPDATE workflow_dispatch_outbox SET lease_owner=$1,lease_token=gen_random_uuid(),lease_expires_at=now()+$3::interval,attempts=attempts+1,updated_at=now()
+		WHERE workflow_run_id IN (SELECT workflow_run_id FROM workflow_dispatch_outbox WHERE available_at<=now() AND (lease_expires_at IS NULL OR lease_expires_at<now()) ORDER BY available_at,created_at LIMIT $2 FOR UPDATE SKIP LOCKED)
+		RETURNING workflow_run_id,lease_token`, owner, limit, lease.String())
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	count := 0
+	for rows.Next() {
+		var run, token uuid.UUID
+		if err = rows.Scan(&run, &token); err != nil {
+			return count, err
+		}
+		if err = s.DispatchReadyWorkflowNodes(ctx, run); err != nil {
+			_, _ = s.Pool.Exec(ctx, `UPDATE workflow_dispatch_outbox SET available_at=now()+LEAST((attempts * 2),60) * interval '1 second',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,last_error=$3,updated_at=now() WHERE workflow_run_id=$1 AND lease_owner=$2`, run, owner, truncate(err.Error(), 1000))
+			continue
+		}
+		if _, err = s.Pool.Exec(ctx, "DELETE FROM workflow_dispatch_outbox WHERE workflow_run_id=$1 AND lease_owner=$2 AND lease_token=$3", run, owner, token); err != nil {
+			return count, err
+		}
+		count++
+	}
+	return count, rows.Err()
 }

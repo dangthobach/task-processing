@@ -10,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/example/task-processing/internal/application/controlplane"
+	"github.com/example/task-processing/internal/persistence/postgres"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -149,7 +150,15 @@ func (a *API) controlUpdate(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 400, "INVALID_RETRY_POLICY", err.Error(), false)
 		return
 	}
-	if err := a.validatePatchDependencies(r, spec, project, patch); err != nil {
+	if err := a.validateFunctionSchemaPatch(spec, patch); err != nil {
+		problem(w, r, 400, "INVALID_INPUT_SCHEMA", err.Error(), false)
+		return
+	}
+	if err := a.validateJobDefinitionPatch(r, spec, project, id, patch); err != nil {
+		problem(w, r, 409, "BATCH_BACKEND_UNSUPPORTED", err.Error(), false)
+		return
+	}
+	if err := a.validatePatchDependencies(r, spec, project, id, patch); err != nil {
 		problem(w, r, 409, "DEPENDENCY_NOT_FOUND", err.Error(), false)
 		return
 	}
@@ -399,7 +408,7 @@ func (a *API) controlPrecondition(w http.ResponseWriter, r *http.Request, spec c
 	problem(w, r, http.StatusPreconditionFailed, "PRECONDITION_FAILED", "Resource changed, was deleted, or no longer satisfies its dependencies", false)
 }
 
-func (a *API) validatePatchDependencies(r *http.Request, spec controlSpec, project uuid.UUID, patch controlplane.Patch) error {
+func (a *API) validatePatchDependencies(r *http.Request, spec controlSpec, project, id uuid.UUID, patch controlplane.Patch) error {
 	switch spec.resource {
 	case "queue":
 		raw, changed := patch["backend_id"]
@@ -414,6 +423,14 @@ func (a *API) validatePatchDependencies(r *http.Request, spec controlSpec, proje
 		err := a.Store.Pool.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM queue_backends WHERE id=$1 AND status='ACTIVE' AND deleted_at IS NULL)", backendID).Scan(&exists)
 		if err != nil || !exists {
 			return fmt.Errorf("queue backend is not active")
+		}
+		var incompatible bool
+		err = a.Store.Pool.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM job_definitions jd JOIN queue_backends qb ON qb.id=$1 WHERE jd.queue_id=$2 AND jd.deleted_at IS NULL AND jd.execution_mode='BATCH' AND qb.backend_type <> 'POSTGRES')`, backendID, id).Scan(&incompatible)
+		if err != nil {
+			return err
+		}
+		if incompatible {
+			return fmt.Errorf("queue has active BATCH job definitions and cannot use an external backend")
 		}
 	case "job_definition":
 		raw, changed := patch["retry_policy_id"]
@@ -490,6 +507,59 @@ func (a *API) validateRetryPolicyPatch(r *http.Request, spec controlSpec, projec
 		return fmt.Errorf("retry policy state is invalid")
 	}
 	return controlplane.ValidateRetryPolicyValues(strategy, initialDelay, maxDelay, multiplier)
+}
+
+func (a *API) validateFunctionSchemaPatch(spec controlSpec, patch controlplane.Patch) error {
+	if spec.resource != "function_definition" {
+		return nil
+	}
+	raw, changed := patch["input_schema"]
+	if !changed {
+		return nil
+	}
+	return postgres.ValidateInputSchema(raw)
+}
+
+// External transports currently implement a single-job delivery contract.
+// Reject every create/update combination that would leave a BATCH definition
+// on such a queue rather than accepting work that no worker can claim.
+func (a *API) validateJobDefinitionPatch(r *http.Request, spec controlSpec, project, id uuid.UUID, patch controlplane.Patch) error {
+	if spec.resource != "job_definition" {
+		return nil
+	}
+	item, err := a.controlSnapshot(r.Context(), spec, project, id, false)
+	if err != nil {
+		return err
+	}
+	var state struct {
+		ExecutionMode string    `json:"execution_mode"`
+		QueueID       uuid.UUID `json:"queue_id"`
+	}
+	if err = json.Unmarshal(item, &state); err != nil {
+		return err
+	}
+	if raw, ok := patch["execution_mode"]; ok {
+		if err = json.Unmarshal(raw, &state.ExecutionMode); err != nil {
+			return fmt.Errorf("execution_mode is invalid")
+		}
+	}
+	if raw, ok := patch["queue_id"]; ok {
+		if err = json.Unmarshal(raw, &state.QueueID); err != nil {
+			return fmt.Errorf("queue_id is invalid")
+		}
+	}
+	if state.ExecutionMode != "BATCH" {
+		return nil
+	}
+	var external bool
+	err = a.Store.Pool.QueryRow(r.Context(), `SELECT EXISTS(SELECT 1 FROM queues q JOIN queue_backends qb ON qb.id=q.backend_id WHERE q.id=$1 AND qb.backend_type <> 'POSTGRES' AND qb.status='ACTIVE' AND qb.deleted_at IS NULL)`, state.QueueID).Scan(&external)
+	if err != nil {
+		return err
+	}
+	if external {
+		return fmt.Errorf("BATCH execution requires a PostgreSQL queue backend")
+	}
+	return nil
 }
 
 func (a *API) patchDependencySQL(spec controlSpec) string {

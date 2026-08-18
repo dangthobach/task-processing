@@ -16,6 +16,7 @@ import (
 type Store struct {
 	Pool             *pgxpool.Pool
 	PayloadProtector kms.Protector
+	SchemaValidator  SchemaValidator
 }
 
 func Open(ctx context.Context, dsn string) (*Store, error) {
@@ -41,12 +42,13 @@ type Definition struct {
 	FunctionKey, FunctionVersion string
 	Priority                     job.Priority
 	Policy                       job.PolicySnapshot
+	InputSchema                  json.RawMessage
 }
 
 func (s *Store) Definition(ctx context.Context, id, projectID uuid.UUID) (Definition, error) {
 	var d Definition
 	var pol []byte
-	err := s.Pool.QueryRow(ctx, `SELECT jd.id,jd.project_id,jd.queue_id,fd.function_key,fd.version,jd.default_priority,jsonb_build_object('retry',jsonb_build_object('max_attempts',COALESCE(rp.max_attempts,1),'strategy',COALESCE(rp.strategy,'FIXED'),'initial_delay_ms',COALESCE(rp.initial_delay_ms,0),'multiplier',COALESCE(rp.multiplier,1),'max_delay_ms',COALESCE(rp.max_delay_ms,0),'jitter_pct',COALESCE(rp.jitter_pct,0),'retry_timeout',COALESCE(rp.retry_timeout,false),'retry_rate_limited',COALESCE(rp.retry_rate_limited,false),'retry_dependency_error',COALESCE(rp.retry_dependency_error,false),'retry_validation_error',COALESCE(rp.retry_validation_error,false)),'timeout_ms',jd.timeout_ms) FROM job_definitions jd JOIN function_definitions fd ON fd.id=jd.function_id LEFT JOIN retry_policies rp ON rp.id=jd.retry_policy_id WHERE jd.id=$1 AND jd.project_id=$2 AND jd.status='ACTIVE' AND jd.deleted_at IS NULL AND fd.deleted_at IS NULL AND (rp.id IS NULL OR rp.deleted_at IS NULL)`, id, projectID).Scan(&d.ID, &d.ProjectID, &d.QueueID, &d.FunctionKey, &d.FunctionVersion, &d.Priority, &pol)
+	err := s.Pool.QueryRow(ctx, `SELECT jd.id,jd.project_id,jd.queue_id,fd.function_key,fd.version,jd.default_priority,fd.input_schema,jsonb_build_object('retry',jsonb_build_object('max_attempts',COALESCE(rp.max_attempts,1),'strategy',COALESCE(rp.strategy,'FIXED'),'initial_delay_ms',COALESCE(rp.initial_delay_ms,0),'multiplier',COALESCE(rp.multiplier,1),'max_delay_ms',COALESCE(rp.max_delay_ms,0),'jitter_pct',COALESCE(rp.jitter_pct,0),'retry_timeout',COALESCE(rp.retry_timeout,false),'retry_rate_limited',COALESCE(rp.retry_rate_limited,false),'retry_dependency_error',COALESCE(rp.retry_dependency_error,false),'retry_validation_error',COALESCE(rp.retry_validation_error,false)),'timeout_ms',jd.timeout_ms) FROM job_definitions jd JOIN function_definitions fd ON fd.id=jd.function_id LEFT JOIN retry_policies rp ON rp.id=jd.retry_policy_id WHERE jd.id=$1 AND jd.project_id=$2 AND jd.status='ACTIVE' AND jd.deleted_at IS NULL AND fd.deleted_at IS NULL AND (rp.id IS NULL OR rp.deleted_at IS NULL)`, id, projectID).Scan(&d.ID, &d.ProjectID, &d.QueueID, &d.FunctionKey, &d.FunctionVersion, &d.Priority, &d.InputSchema, &pol)
 	if err != nil {
 		return d, err
 	}
@@ -95,6 +97,9 @@ func (s *Store) Submit(ctx context.Context, input Submit) (job.Run, error) {
 	if err != nil {
 		return job.Run{}, err
 	}
+	if err = s.SchemaValidator.Validate(d.InputSchema, payload); err != nil {
+		return job.Run{}, err
+	}
 	storedPayload, ciphertext, keyRef, err := s.sealPayload(ctx, input.ProjectID, d.ID, payload)
 	if err != nil {
 		return job.Run{}, err
@@ -110,7 +115,12 @@ func (s *Store) Submit(ctx context.Context, input Submit) (job.Run, error) {
 		return job.Run{}, err
 	}
 	if created {
-		if _, err = tx.Exec(ctx, `INSERT INTO outbox_events(project_id,event_type,aggregate_id,dispatch_id,payload) VALUES($1,'job.enqueue',$2,$3,jsonb_build_object('run_id',$2,'dispatch_id',$3))`, input.ProjectID, run.ID, run.DispatchID); err != nil {
+		if allowed, rateErr := s.takeRateLimits(ctx, tx, input.ProjectID, d.QueueID, d.ID, "SUBMISSION"); rateErr != nil {
+			return job.Run{}, rateErr
+		} else if !allowed {
+			return job.Run{}, ErrRateLimited
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO outbox_events(project_id,event_type,aggregate_id,dispatch_id,payload) VALUES($1,'job.enqueue',$2,$3,jsonb_build_object('run_id',$2::uuid,'dispatch_id',$3::uuid))`, input.ProjectID, run.ID, run.DispatchID); err != nil {
 			return job.Run{}, err
 		}
 	}
@@ -239,6 +249,9 @@ func (s *Store) SubmitBulk(ctx context.Context, inputs []Submit) ([]job.Run, err
 		if normalizeErr != nil {
 			return nil, normalizeErr
 		}
+		if normalizeErr = s.SchemaValidator.Validate(d.InputSchema, payload); normalizeErr != nil {
+			return nil, normalizeErr
+		}
 		storedPayload, ciphertext, keyRef, sealErr := s.sealPayload(ctx, in.ProjectID, d.ID, payload)
 		if sealErr != nil {
 			return nil, sealErr
@@ -248,7 +261,12 @@ func (s *Store) SubmitBulk(ctx context.Context, inputs []Submit) ([]job.Run, err
 		if err != nil {
 			return nil, err
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO outbox_events(project_id,event_type,aggregate_id,dispatch_id,payload) VALUES($1,'job.enqueue',$2,$3,jsonb_build_object('run_id',$2,'dispatch_id',$3))`, in.ProjectID, id, dispatchID); err != nil {
+		if allowed, rateErr := s.takeRateLimits(ctx, tx, in.ProjectID, d.QueueID, d.ID, "SUBMISSION"); rateErr != nil {
+			return nil, rateErr
+		} else if !allowed {
+			return nil, ErrRateLimited
+		}
+		if _, err = tx.Exec(ctx, `INSERT INTO outbox_events(project_id,event_type,aggregate_id,dispatch_id,payload) VALUES($1,'job.enqueue',$2,$3,jsonb_build_object('run_id',$2::uuid,'dispatch_id',$3::uuid))`, in.ProjectID, id, dispatchID); err != nil {
 			return nil, err
 		}
 		runs = append(runs, job.Run{ID: id, ProjectID: in.ProjectID, DefinitionID: d.ID, QueueID: d.QueueID, Status: job.EnqueuePending, Priority: priority, Payload: payload, Policy: d.Policy, FunctionKey: d.FunctionKey, FunctionVersion: d.FunctionVersion, IdempotencyKey: in.IdempotencyKey, DispatchID: dispatchID})

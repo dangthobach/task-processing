@@ -30,6 +30,7 @@ Open `http://localhost:5173`. The Vite proxy sends `/api` and `/metrics` to the 
 The common HTTP envelope, distributed tracing, audit and optimistic-locking rules are in [docs/API_CONTRACT.md](docs/API_CONTRACT.md).
 The exact backend-to-React endpoint mapping is in [docs/API_FE_MAPPING.md](docs/API_FE_MAPPING.md).
 The portable queue semantics and PostgreSQL adapter are in [docs/QUEUE_BACKENDS.md](docs/QUEUE_BACKENDS.md).
+The Vietnamese operator walkthrough, UI enum reference and BRD follow-up backlog are in [docs/USER_OPERATIONS_GUIDE.vi.md](docs/USER_OPERATIONS_GUIDE.vi.md).
 
 The API listens on `:8080`; open `http://localhost:8080/` for the small operational dashboard. Development identity headers are required for protected routes:
 

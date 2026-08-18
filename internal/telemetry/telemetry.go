@@ -18,23 +18,25 @@ import (
 var Metrics = newMetrics()
 
 type metrics struct {
-	Attempts        *prometheus.CounterVec
-	Completed       *prometheus.CounterVec
-	Inflight        prometheus.Gauge
-	QueueOldest     *prometheus.GaugeVec
-	WorkerHeartbeat *prometheus.GaugeVec
-	OutboxFailures  prometheus.Counter
+	Attempts            *prometheus.CounterVec
+	Completed           *prometheus.CounterVec
+	Inflight            prometheus.Gauge
+	QueueOldest         *prometheus.GaugeVec
+	WorkerHeartbeat     *prometheus.GaugeVec
+	OutboxFailures      prometheus.Counter
+	MaintenanceFailures *prometheus.CounterVec
+	RetentionDeleted    prometheus.Counter
 }
 
 func newMetrics() *metrics {
-	return &metrics{Attempts: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "task_attempts_total", Help: "Task attempts started"}, []string{"function"}), Completed: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "task_runs_completed_total", Help: "Terminal task runs"}, []string{"status", "error_class"}), Inflight: prometheus.NewGauge(prometheus.GaugeOpts{Name: "task_worker_inflight", Help: "Attempts currently executing in this worker process"}), QueueOldest: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "task_queue_oldest_age_seconds", Help: "Age of the oldest queued item"}, []string{"queue"}), WorkerHeartbeat: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "task_worker_heartbeat_age_seconds", Help: "Age of latest worker heartbeat"}, []string{"worker"}), OutboxFailures: prometheus.NewCounter(prometheus.CounterOpts{Name: "task_outbox_failures_total", Help: "Failed outbox backend publications"})}
+	return &metrics{Attempts: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "task_attempts_total", Help: "Task attempts started"}, []string{"function"}), Completed: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "task_runs_completed_total", Help: "Terminal task runs"}, []string{"status", "error_class"}), Inflight: prometheus.NewGauge(prometheus.GaugeOpts{Name: "task_worker_inflight", Help: "Attempts currently executing in this worker process"}), QueueOldest: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "task_queue_oldest_age_seconds", Help: "Age of the oldest queued item"}, []string{"queue"}), WorkerHeartbeat: prometheus.NewGaugeVec(prometheus.GaugeOpts{Name: "task_worker_heartbeat_age_seconds", Help: "Age of latest worker heartbeat"}, []string{"worker"}), OutboxFailures: prometheus.NewCounter(prometheus.CounterOpts{Name: "task_outbox_failures_total", Help: "Failed outbox backend publications"}), MaintenanceFailures: prometheus.NewCounterVec(prometheus.CounterOpts{Name: "task_maintenance_failures_total", Help: "Worker maintenance loop failures"}, []string{"operation"}), RetentionDeleted: prometheus.NewCounter(prometheus.CounterOpts{Name: "task_retention_rows_deleted_total", Help: "Rows deleted by retention policies"})}
 }
 
 var registerOnce sync.Once
 
 func RegisterMetrics() {
 	registerOnce.Do(func() {
-		prometheus.MustRegister(Metrics.Attempts, Metrics.Completed, Metrics.Inflight, Metrics.QueueOldest, Metrics.WorkerHeartbeat, Metrics.OutboxFailures)
+		prometheus.MustRegister(Metrics.Attempts, Metrics.Completed, Metrics.Inflight, Metrics.QueueOldest, Metrics.WorkerHeartbeat, Metrics.OutboxFailures, Metrics.MaintenanceFailures, Metrics.RetentionDeleted)
 	})
 }
 

@@ -19,7 +19,7 @@ type Patch map[string]json.RawMessage
 var allowed = map[string]map[string]struct{}{
 	"queue":               {"name": {}, "backend_id": {}, "max_concurrency": {}, "default_priority": {}},
 	"retry_policy":        {"name": {}, "max_attempts": {}, "strategy": {}, "initial_delay_ms": {}, "multiplier": {}, "max_delay_ms": {}, "jitter_pct": {}, "retry_timeout": {}, "retry_rate_limited": {}, "retry_dependency_error": {}, "retry_validation_error": {}},
-	"rate_limit_policy":   {"name": {}, "capacity": {}, "refill_tokens": {}, "refill_period_ms": {}, "status": {}},
+	"rate_limit_policy":   {"name": {}, "capacity": {}, "refill_tokens": {}, "refill_period_ms": {}, "enforcement_point": {}, "status": {}},
 	"function_definition": {"input_schema": {}, "status": {}},
 	"job_definition":      {"name": {}, "retry_policy_id": {}, "default_priority": {}, "timeout_ms": {}, "execution_mode": {}, "batch_size": {}, "batch_max_wait_ms": {}, "status": {}},
 	"schedule":            {"cron_expression": {}, "timezone": {}, "with_seconds": {}, "run_at": {}, "status": {}},
@@ -84,6 +84,9 @@ func ValidatePatch(resource string, patch Patch) error {
 			return err
 		}
 		if err := positiveInt(patch, "refill_period_ms", 1, 86400000); err != nil {
+			return err
+		}
+		if err := enum(patch, "enforcement_point", "SUBMISSION", "WORKER_START"); err != nil {
 			return err
 		}
 		return enum(patch, "status", "ACTIVE", "DISABLED")

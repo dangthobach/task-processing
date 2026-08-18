@@ -47,6 +47,18 @@ func (w *Worker) Run(ctx context.Context) error {
 	if w.Backends == nil {
 		w.Backends = queuebackend.NewRegistry(queuebackend.NewPostgres(w.Store))
 	}
+	if err := w.Backends.Refresh(ctx, w.Store); err != nil {
+		return fmt.Errorf("load queue backend configuration: %w", err)
+	}
+	defer func() {
+		for _, backend := range w.Backends.List() {
+			if closable, ok := backend.(queuebackend.ClosableBackend); ok {
+				if err := closable.Close(); err != nil {
+					w.Log.Warn("close queue backend failed", "backend", backend.Type(), "error", err)
+				}
+			}
+		}
+	}()
 	// Stop claiming immediately on shutdown but let in-flight handlers finish
 	// during the drain window. Their context is cancelled only after that window.
 	workCtx, cancelWork := context.WithCancel(context.WithoutCancel(ctx))
@@ -65,6 +77,8 @@ func (w *Worker) Run(ctx context.Context) error {
 	defer batchTicker.Stop()
 	heartbeat := time.NewTicker(cfg.Intervals.Heartbeat)
 	defer heartbeat.Stop()
+	retentionTicker := time.NewTicker(cfg.Intervals.Retention)
+	defer retentionTicker.Stop()
 	defer w.Store.SetWorkerStatus(context.Background(), w.ID, "OFFLINE")
 	slots := newSlots(cfg.Concurrency)
 	var wg sync.WaitGroup
@@ -90,16 +104,42 @@ func (w *Worker) Run(ctx context.Context) error {
 				w.Log.Error("worker heartbeat failed", "error", err)
 			}
 			w.refreshMetrics(ctx)
+			if err := w.Backends.Refresh(ctx, w.Store); err != nil {
+				w.Log.Error("queue backend configuration refresh failed", "error", err)
+			}
 		case <-outboxTicker.C:
 			w.dispatchOutbox(ctx)
 		case <-auditTicker.C:
-			_, _ = w.Store.DispatchAuditOutbox(ctx, 100)
+			if _, err := w.Store.DispatchAuditOutbox(ctx, 100); err != nil {
+				telemetry.Metrics.MaintenanceFailures.WithLabelValues("audit_outbox").Inc()
+				w.Log.Error("audit outbox dispatch failed", "error", err)
+			}
 		case <-retryTicker.C:
-			_, _ = w.Store.PromoteRetries(ctx)
+			if _, err := w.Store.PromoteRetries(ctx); err != nil {
+				telemetry.Metrics.MaintenanceFailures.WithLabelValues("retry_promotion").Inc()
+				w.Log.Error("retry promotion failed", "error", err)
+			}
 		case <-batchTicker.C:
-			_, _ = w.Store.RecoverExpiredBatches(ctx)
+			if _, err := w.Store.RecoverExpiredBatches(ctx); err != nil {
+				telemetry.Metrics.MaintenanceFailures.WithLabelValues("batch_recovery").Inc()
+				w.Log.Error("batch recovery failed", "error", err)
+			}
 		case <-leaseTicker.C:
-			_, _ = w.Store.RecoverExpiredLeases(ctx)
+			if _, err := w.Store.RecoverExpiredLeases(ctx); err != nil {
+				telemetry.Metrics.MaintenanceFailures.WithLabelValues("lease_recovery").Inc()
+				w.Log.Error("lease recovery failed", "error", err)
+			}
+			if _, err := w.Store.ReconcileWorkflowTransitions(ctx, w.Owner, 100, w.Lease); err != nil {
+				telemetry.Metrics.MaintenanceFailures.WithLabelValues("workflow_reconciliation").Inc()
+				w.Log.Error("workflow transition reconciliation failed", "error", err)
+			}
+		case <-retentionTicker.C:
+			if deleted, err := w.Store.ApplyRetention(ctx, 1000); err != nil {
+				telemetry.Metrics.MaintenanceFailures.WithLabelValues("retention").Inc()
+				w.Log.Error("retention execution failed", "error", err)
+			} else {
+				telemetry.Metrics.RetentionDeleted.Add(float64(deleted))
+			}
 		case <-claimTicker.C:
 			capacity := slots.ReserveAvailable()
 			if capacity == 0 {
@@ -134,6 +174,32 @@ func (w *Worker) Run(ctx context.Context) error {
 				}(r)
 			}
 			slots.ReleaseUnused(capacity - len(runs))
+			// External backends are responsible only for transport delivery. Every
+			// delivery still acquires PostgreSQL dispatch ownership before starting
+			// an attempt, which prevents stale stream messages from running.
+			for _, backend := range w.Backends.List() {
+				if backend.Type() == queuebackend.Postgres {
+					continue
+				}
+				capacity = slots.ReserveAvailable()
+				if capacity == 0 {
+					break
+				}
+				deliveries, reserveErr := backend.Reserve(ctx, queuebackend.ReserveRequest{WorkerID: w.ID, Owner: w.Owner, Limit: capacity, Lease: w.Lease})
+				if reserveErr != nil {
+					w.Log.Error("backend reserve failed", "backend", backend.Type(), "error", reserveErr)
+					slots.ReleaseUnused(capacity)
+					continue
+				}
+				for _, delivery := range deliveries {
+					wg.Add(1)
+					go func(b queuebackend.Backend, d queuebackend.Delivery) {
+						defer func() { slots.Release(1); wg.Done() }()
+						w.executeDelivery(workCtx, b, d)
+					}(backend, delivery)
+				}
+				slots.ReleaseUnused(capacity - len(deliveries))
+			}
 		}
 	}
 }
@@ -158,7 +224,7 @@ func (w *Worker) dispatchOutbox(ctx context.Context) {
 		return
 	}
 	for _, item := range items {
-		backend, lookupErr := w.Backends.Get(queuebackend.Type(item.BackendType))
+		backend, lookupErr := w.Backends.GetForBackend(item.BackendID, queuebackend.Type(item.BackendType))
 		if lookupErr == nil {
 			lookupErr = backend.Enqueue(ctx, queuebackend.Message{DispatchID: item.DispatchID, RunID: item.RunID, ProjectID: item.ProjectID, QueueID: item.QueueID, Priority: job.Priority(item.Priority), AvailableAt: item.AvailableAt})
 		}
@@ -276,8 +342,6 @@ func (w *Worker) execute(parent context.Context, runID, token uuid.UUID) {
 				return
 			}
 			w.Log.Error("complete success failed", "run_id", runID, "error", err)
-		} else if err = w.Store.AdvanceWorkflowForJob(spanCtx, ex.RunID, true); err != nil {
-			w.Log.Error("advance workflow failed", "run_id", runID, "error", err)
 		}
 		telemetry.Metrics.Completed.WithLabelValues("SUCCEEDED", "").Inc()
 		w.writeJobLog(spanCtx, ex, "INFO", "job handler completed", nil)
@@ -290,13 +354,70 @@ func (w *Worker) execute(parent context.Context, runID, token uuid.UUID) {
 			return
 		}
 		w.Log.Error("complete failure failed", "run_id", runID, "error", e)
-	} else if ex.Attempt >= ex.Policy.Retry.MaxAttempts || !job.Retryable(c.Class, ex.Policy.Retry) {
-		if advanceErr := w.Store.AdvanceWorkflowForJob(spanCtx, ex.RunID, false); advanceErr != nil {
-			w.Log.Error("advance workflow failed", "run_id", runID, "error", advanceErr)
-		}
 	}
 	telemetry.Metrics.Completed.WithLabelValues("FAILED", string(c.Class)).Inc()
 	w.writeJobLog(spanCtx, ex, "ERROR", "job handler failed", map[string]any{"error_class": c.Class, "error_code": c.Code})
+}
+
+// executeDelivery mirrors execute after the adapter has atomically taken
+// dispatch ownership and started the attempt. Acknowledging the transport is
+// deliberately delegated to the adapter only after PostgreSQL records the
+// terminal/retry transition.
+func (w *Worker) executeDelivery(parent context.Context, backend queuebackend.Backend, delivery queuebackend.Delivery) {
+	ex := delivery.Execution
+	spanCtx, span := otel.Tracer("task-processing/worker").Start(parent, "task.attempt", trace.WithAttributes(attribute.String("task.run_id", ex.RunID.String()), attribute.String("task.backend", string(backend.Type()))))
+	defer span.End()
+	telemetry.Metrics.Attempts.WithLabelValues(ex.FunctionKey).Inc()
+	w.writeJobLog(spanCtx, ex, "INFO", "job handler started", nil)
+	telemetry.Metrics.Inflight.Inc()
+	defer telemetry.Metrics.Inflight.Dec()
+	h, err := w.Registry.Get(ex.FunctionKey)
+	jobCtx, cancelJob := context.WithCancelCause(spanCtx)
+	defer cancelJob(nil)
+	if err == nil {
+		ctx, cancel := context.WithTimeout(jobCtx, time.Duration(ex.Policy.TimeoutMS)*time.Millisecond)
+		defer cancel()
+		stopLease := make(chan struct{})
+		defer close(stopLease)
+		go w.renewLease(ctx, ex, stopLease, cancelJob)
+		h = workermiddleware.Chain(h, append([]workermiddleware.Middleware{workermiddleware.Recover, workermiddleware.StructuredLog(w.Log)}, w.Middleware...)...)
+		err = h(job.NewExecutionContext(ctx, &ex, w))
+	}
+	if errors.Is(context.Cause(jobCtx), postgres.ErrLeaseLost) {
+		// The recovery loop will create a new generation; acknowledge this old
+		// delivery so the external broker does not fight PostgreSQL's retry time.
+		if ackErr := backend.Ack(spanCtx, delivery); ackErr != nil {
+			w.Log.Warn("acknowledge lost lease delivery failed", "run_id", ex.RunID, "backend", backend.Type(), "error", ackErr)
+		}
+		return
+	}
+	if err == nil {
+		ackErr := backend.Ack(spanCtx, delivery)
+		var transportAck *queuebackend.TransportAckError
+		if ackErr != nil && !errors.As(ackErr, &transportAck) {
+			w.Log.Error("backend acknowledgement failed", "run_id", ex.RunID, "backend", backend.Type(), "error", ackErr)
+			return
+		}
+		if transportAck != nil {
+			w.Log.Warn("job completed but transport acknowledgement was not confirmed", "run_id", ex.RunID, "backend", backend.Type(), "error", transportAck)
+		}
+		telemetry.Metrics.Completed.WithLabelValues("SUCCEEDED", "").Inc()
+		w.writeJobLog(spanCtx, ex, "INFO", "job handler completed", nil)
+		return
+	}
+	classified := job.Classify(err)
+	span.RecordError(err)
+	nackErr := backend.Nack(spanCtx, delivery, err)
+	var transportAck *queuebackend.TransportAckError
+	if nackErr != nil && !errors.As(nackErr, &transportAck) {
+		w.Log.Error("backend negative acknowledgement failed", "run_id", ex.RunID, "backend", backend.Type(), "error", nackErr)
+		return
+	}
+	if transportAck != nil {
+		w.Log.Warn("job failure persisted but transport acknowledgement was not confirmed", "run_id", ex.RunID, "backend", backend.Type(), "error", transportAck)
+	}
+	telemetry.Metrics.Completed.WithLabelValues("FAILED", string(classified.Class)).Inc()
+	w.writeJobLog(spanCtx, ex, "ERROR", "job handler failed", map[string]any{"error_class": classified.Class, "error_code": classified.Code})
 }
 func (w *Worker) writeJobLog(ctx context.Context, ex job.Execution, level, message string, fields map[string]any) {
 	logCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), time.Second)

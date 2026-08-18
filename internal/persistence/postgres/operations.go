@@ -40,15 +40,35 @@ func (s *Store) TransitionSchedule(ctx context.Context, project, id uuid.UUID, t
 	return tag.RowsAffected() == 1, err
 }
 func (s *Store) CancelRun(ctx context.Context, project, id uuid.UUID, version int64) (bool, error) {
-	tag, err := s.Pool.Exec(ctx, "UPDATE job_runs SET status='CANCELLED',finished_at=now(),updated_at=now() WHERE id=$1 AND project_id=$2 AND row_version=$3 AND status IN ('CREATED','ENQUEUE_PENDING','QUEUED','RETRY_WAIT')", id, project, version)
+	// Invalidate the outstanding dispatch so a delayed external message cannot
+	// reserve a job that was cancelled after publication.
+	tag, err := s.Pool.Exec(ctx, "UPDATE job_runs SET status='CANCELLED',current_dispatch_id=gen_random_uuid(),finished_at=now(),updated_at=now() WHERE id=$1 AND project_id=$2 AND row_version=$3 AND status IN ('CREATED','ENQUEUE_PENDING','QUEUED','RETRY_WAIT')", id, project, version)
 	return tag.RowsAffected() == 1, err
 }
 func (s *Store) RetryRun(ctx context.Context, project, id uuid.UUID, version int64) (bool, error) {
-	tag, err := s.Pool.Exec(ctx, `UPDATE job_runs SET status='QUEUED',available_at=now(),finished_at=NULL,updated_at=now() WHERE id=$1 AND project_id=$2 AND row_version=$3 AND status IN ('DEAD_LETTER','CANCELLED')`, id, project, version)
-	if err == nil && tag.RowsAffected() == 1 {
-		_, err = s.Pool.Exec(ctx, "UPDATE dlq_entries SET replayed_at=now() WHERE job_run_id=$1", id)
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return false, err
 	}
-	return tag.RowsAffected() == 1, err
+	defer tx.Rollback(ctx)
+	var run, dispatch uuid.UUID
+	err = tx.QueryRow(ctx, `UPDATE job_runs SET status='ENQUEUE_PENDING',current_dispatch_id=gen_random_uuid(),available_at=now(),finished_at=NULL,updated_at=now()
+		WHERE id=$1 AND project_id=$2 AND row_version=$3 AND status IN ('DEAD_LETTER','CANCELLED')
+		RETURNING id,current_dispatch_id`, id, project, version).Scan(&run, &dispatch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx, `INSERT INTO outbox_events(project_id,event_type,aggregate_id,dispatch_id,payload)
+		VALUES($1,'job.enqueue',$2,$3,jsonb_build_object('run_id',$2::uuid,'dispatch_id',$3::uuid))`, project, run, dispatch); err != nil {
+		return false, err
+	}
+	if _, err = tx.Exec(ctx, "UPDATE dlq_entries SET replayed_at=now() WHERE job_run_id=$1", run); err != nil {
+		return false, err
+	}
+	return true, tx.Commit(ctx)
 }
 func (s *Store) ReplayDLQ(ctx context.Context, project, id uuid.UUID, version int64) (uuid.UUID, bool, error) {
 	tx, err := s.Pool.Begin(ctx)
@@ -64,12 +84,18 @@ func (s *Store) ReplayDLQ(ctx context.Context, project, id uuid.UUID, version in
 	if err != nil {
 		return uuid.Nil, false, err
 	}
-	tag, err := tx.Exec(ctx, "UPDATE job_runs SET status='QUEUED',available_at=now(),finished_at=NULL,updated_at=now() WHERE id=$1 AND project_id=$2 AND status='DEAD_LETTER'", run, project)
+	var dispatch uuid.UUID
+	err = tx.QueryRow(ctx, `UPDATE job_runs SET status='ENQUEUE_PENDING',current_dispatch_id=gen_random_uuid(),available_at=now(),finished_at=NULL,updated_at=now()
+		WHERE id=$1 AND project_id=$2 AND status='DEAD_LETTER' RETURNING current_dispatch_id`, run, project).Scan(&dispatch)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return uuid.Nil, false, nil
+	}
 	if err != nil {
 		return uuid.Nil, false, err
 	}
-	if tag.RowsAffected() != 1 {
-		return uuid.Nil, false, nil
+	if _, err = tx.Exec(ctx, `INSERT INTO outbox_events(project_id,event_type,aggregate_id,dispatch_id,payload)
+		VALUES($1,'job.enqueue',$2,$3,jsonb_build_object('run_id',$2::uuid,'dispatch_id',$3::uuid))`, project, run, dispatch); err != nil {
+		return uuid.Nil, false, err
 	}
 	if _, err = tx.Exec(ctx, "UPDATE dlq_entries SET replayed_at=now() WHERE id=$1 AND row_version=$2", id, version); err != nil {
 		return uuid.Nil, false, err

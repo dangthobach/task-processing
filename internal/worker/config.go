@@ -11,6 +11,7 @@ import (
 type Intervals struct {
 	Claim, Outbox, AuditOutbox, RetryPromotion time.Duration
 	LeaseRecovery, BatchRecovery, Heartbeat    time.Duration
+	Retention                                  time.Duration
 }
 
 type Config struct {
@@ -23,7 +24,7 @@ type Config struct {
 func DefaultConfig() Config {
 	return Config{Concurrency: 10, Lease: time.Minute, DrainTimeout: 30 * time.Second, Intervals: Intervals{
 		Claim: 250 * time.Millisecond, Outbox: 500 * time.Millisecond, AuditOutbox: time.Second,
-		RetryPromotion: time.Second, LeaseRecovery: 5 * time.Second, BatchRecovery: 5 * time.Second, Heartbeat: 10 * time.Second,
+		RetryPromotion: time.Second, LeaseRecovery: 5 * time.Second, BatchRecovery: 5 * time.Second, Heartbeat: 10 * time.Second, Retention: time.Hour,
 	}}
 }
 
@@ -64,6 +65,9 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.Intervals.Heartbeat, err = millis(getenv, "WORKER_HEARTBEAT_INTERVAL_MS", cfg.Intervals.Heartbeat, 10*time.Second); err != nil {
+		return Config{}, err
+	}
+	if cfg.Intervals.Retention, err = seconds(getenv, "WORKER_RETENTION_INTERVAL_SECONDS", cfg.Intervals.Retention, time.Minute); err != nil {
 		return Config{}, err
 	}
 	return cfg, nil

@@ -48,7 +48,11 @@ func VerifyBaseline(ctx context.Context, conn *pgxpool.Conn, through int64) erro
 		}
 		if requirement.table != "" {
 			var exists bool
-			if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", requirement.table).Scan(&exists); err != nil {
+			if err := conn.QueryRow(ctx, `SELECT EXISTS(
+				SELECT 1 FROM pg_catalog.pg_class c
+				JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+				WHERE n.nspname=current_schema() AND c.relname=$1 AND c.relkind IN ('r','p')
+			)`, requirement.table).Scan(&exists); err != nil {
 				return fmt.Errorf("inspect baseline table %s: %w", requirement.table, err)
 			}
 			if !exists {
@@ -69,7 +73,11 @@ func VerifyBaseline(ctx context.Context, conn *pgxpool.Conn, through int64) erro
 		}
 		if requirement.index != "" {
 			var exists bool
-			if err := conn.QueryRow(ctx, "SELECT to_regclass($1) IS NOT NULL", requirement.index).Scan(&exists); err != nil {
+			if err := conn.QueryRow(ctx, `SELECT EXISTS(
+				SELECT 1 FROM pg_catalog.pg_class c
+				JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+				WHERE n.nspname=current_schema() AND c.relname=$1 AND c.relkind IN ('i','r','p')
+			)`, requirement.index).Scan(&exists); err != nil {
 				return fmt.Errorf("inspect baseline index %s: %w", requirement.index, err)
 			}
 			if !exists {

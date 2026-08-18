@@ -143,6 +143,8 @@ func (a *API) Router() http.Handler {
 	r.Group(func(r chi.Router) {
 		r.Use(a.requireAuth, a.scope, a.authorize)
 		r.Get("/api/v1/events", a.streamEvents)
+		r.Post("/api/v1/queue-backends", a.createQueueBackend)
+		r.Get("/api/v1/queue-backends", a.listQueueBackends)
 		r.Post("/api/v1/retry-policies", a.createRetryPolicy)
 		r.Post("/api/v1/rate-limit-policies", a.createRateLimitPolicy)
 		r.Post("/api/v1/workflows", a.createWorkflow)
@@ -170,6 +172,7 @@ func (a *API) Router() http.Handler {
 		r.Post("/api/v1/queues/{id}/resume", a.queueState("ACTIVE", "queue.resumed"))
 		r.Post("/api/v1/queues/{id}/drain", a.queueState("DRAINING", "queue.draining"))
 		r.Post("/api/v1/schedules", a.createSchedule)
+		r.Post("/api/v1/schedules/preview", a.previewSchedule)
 		r.Post("/api/v1/schedules/{id}/pause", a.scheduleState("PAUSED"))
 		r.Post("/api/v1/schedules/{id}/resume", a.scheduleState("ACTIVE"))
 		r.Get("/api/v1/dlq", a.listDLQ)
@@ -306,6 +309,9 @@ func routePermission(r *http.Request) string {
 		return "event:read"
 	}
 	if strings.Contains(path, "/rbac/") {
+		return "platform:admin"
+	}
+	if strings.Contains(path, "/queue-backends") {
 		return "platform:admin"
 	}
 	if strings.Contains(path, "/workflows") {
@@ -498,13 +504,14 @@ func (a *API) createRateLimitPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ProjectID      uuid.UUID  `json:"project_id"`
-		Name           string     `json:"name"`
-		Scope          string     `json:"scope"`
-		TargetID       *uuid.UUID `json:"target_id"`
-		Capacity       int        `json:"capacity"`
-		RefillTokens   int        `json:"refill_tokens"`
-		RefillPeriodMS int64      `json:"refill_period_ms"`
+		ProjectID        uuid.UUID  `json:"project_id"`
+		Name             string     `json:"name"`
+		Scope            string     `json:"scope"`
+		TargetID         *uuid.UUID `json:"target_id"`
+		Capacity         int        `json:"capacity"`
+		RefillTokens     int        `json:"refill_tokens"`
+		RefillPeriodMS   int64      `json:"refill_period_ms"`
+		EnforcementPoint string     `json:"enforcement_point"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -519,6 +526,13 @@ func (a *API) createRateLimitPolicy(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.Scope != "PROJECT" && req.Scope != "QUEUE" && req.Scope != "FUNCTION" {
 		problem(w, r, 400, "INVALID_RATE_LIMIT_SCOPE", "scope must be PROJECT, QUEUE or FUNCTION", false)
+		return
+	}
+	if req.EnforcementPoint == "" {
+		req.EnforcementPoint = "WORKER_START"
+	}
+	if req.EnforcementPoint != "SUBMISSION" && req.EnforcementPoint != "WORKER_START" {
+		problem(w, r, 400, "INVALID_RATE_LIMIT_ENFORCEMENT", "enforcement_point must be SUBMISSION or WORKER_START", false)
 		return
 	}
 	if (req.Scope == "PROJECT") != (req.TargetID == nil) {
@@ -545,7 +559,7 @@ func (a *API) createRateLimitPolicy(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(r.Context())
 	var id uuid.UUID
 	var version int64
-	err = tx.QueryRow(r.Context(), "INSERT INTO rate_limit_policies(project_id,name,scope,target_id,capacity,refill_tokens,refill_period_ms) VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING id,row_version", req.ProjectID, req.Name, req.Scope, req.TargetID, req.Capacity, req.RefillTokens, req.RefillPeriodMS).Scan(&id, &version)
+	err = tx.QueryRow(r.Context(), "INSERT INTO rate_limit_policies(project_id,name,scope,target_id,capacity,refill_tokens,refill_period_ms,enforcement_point) VALUES($1,$2,$3,$4,$5,$6,$7,$8) RETURNING id,row_version", req.ProjectID, req.Name, req.Scope, req.TargetID, req.Capacity, req.RefillTokens, req.RefillPeriodMS, req.EnforcementPoint).Scan(&id, &version)
 	if err != nil {
 		handleErr(w, r, err)
 		return
@@ -590,6 +604,10 @@ func (a *API) createFunctionDefinition(w http.ResponseWriter, r *http.Request) {
 	}
 	if len(req.InputSchema) == 0 {
 		req.InputSchema = json.RawMessage(`{}`)
+	}
+	if err := postgres.ValidateInputSchema(req.InputSchema); err != nil {
+		problem(w, r, 400, "INVALID_INPUT_SCHEMA", err.Error(), false)
+		return
 	}
 	var id uuid.UUID
 	err := a.Store.Pool.QueryRow(r.Context(), "INSERT INTO function_definitions(project_id,function_key,version,input_schema) VALUES($1,$2,$3,$4) RETURNING id", req.ProjectID, req.FunctionKey, req.Version, req.InputSchema).Scan(&id)
@@ -653,7 +671,7 @@ func (a *API) createJobDefinition(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var id uuid.UUID
-	err := a.Store.Pool.QueryRow(r.Context(), `INSERT INTO job_definitions(project_id,function_id,queue_id,retry_policy_id,name,default_priority,timeout_ms,execution_mode,batch_size,batch_max_wait_ms) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10 WHERE EXISTS(SELECT 1 FROM function_definitions WHERE id=$2 AND project_id=$1 AND deleted_at IS NULL FOR UPDATE) AND EXISTS(SELECT 1 FROM queues WHERE id=$3 AND project_id=$1 AND deleted_at IS NULL FOR UPDATE) AND ($4 IS NULL OR EXISTS(SELECT 1 FROM retry_policies WHERE id=$4 AND project_id=$1 AND deleted_at IS NULL FOR UPDATE)) RETURNING id`, req.ProjectID, req.FunctionID, req.QueueID, req.RetryPolicyID, req.Name, req.DefaultPriority, req.TimeoutMS, req.ExecutionMode, req.BatchSize, req.BatchMaxWaitMS).Scan(&id)
+	err := a.Store.Pool.QueryRow(r.Context(), `INSERT INTO job_definitions(project_id,function_id,queue_id,retry_policy_id,name,default_priority,timeout_ms,execution_mode,batch_size,batch_max_wait_ms) SELECT $1,$2,$3,$4,$5,$6,$7,$8,$9,$10 WHERE EXISTS(SELECT 1 FROM function_definitions WHERE id=$2 AND project_id=$1 AND deleted_at IS NULL FOR UPDATE) AND EXISTS(SELECT 1 FROM queues WHERE id=$3 AND project_id=$1 AND deleted_at IS NULL FOR UPDATE) AND ($4::uuid IS NULL OR EXISTS(SELECT 1 FROM retry_policies WHERE id=$4 AND project_id=$1 AND deleted_at IS NULL FOR UPDATE)) AND ($8 <> 'BATCH' OR NOT EXISTS(SELECT 1 FROM queues q JOIN queue_backends qb ON qb.id=q.backend_id WHERE q.id=$3 AND qb.backend_type <> 'POSTGRES')) RETURNING id`, req.ProjectID, req.FunctionID, req.QueueID, req.RetryPolicyID, req.Name, req.DefaultPriority, req.TimeoutMS, req.ExecutionMode, req.BatchSize, req.BatchMaxWaitMS).Scan(&id)
 	if errors.Is(err, pgx.ErrNoRows) {
 		problem(w, r, 404, "DEPENDENCY_NOT_FOUND", "Function, queue or retry policy is outside this project", false)
 		return
@@ -1063,6 +1081,64 @@ func (a *API) batchLogs(w http.ResponseWriter, r *http.Request) {
 	}
 	writeJSON(w, 200, out)
 }
+
+// Queue backend configuration is platform-level and intentionally never
+// returned once accepted. Its plaintext only exists in this request and while
+// encrypting it with the configured KMS protector.
+func (a *API) createQueueBackend(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, "admin") {
+		return
+	}
+	var req struct {
+		Name        string          `json:"name"`
+		BackendType string          `json:"backend_type"`
+		Config      json.RawMessage `json:"config"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" || (req.BackendType != "REDIS_STREAMS" && req.BackendType != "JETSTREAM") || !json.Valid(req.Config) {
+		problem(w, r, 400, "INVALID_QUEUE_BACKEND", "name, backend_type and JSON config are required", false)
+		return
+	}
+	backend, err := (controlplane.QueueBackendService{Store: a.Store}).Create(r.Context(), controlplane.CreateQueueBackend{Name: req.Name, BackendType: req.BackendType, Config: req.Config})
+	if err != nil {
+		problem(w, r, 400, "INVALID_QUEUE_BACKEND", err.Error(), false)
+		return
+	}
+	writeJSON(w, http.StatusCreated, map[string]any{"id": backend.ID, "name": backend.Name, "backend_type": backend.BackendType, "status": backend.Status, "version": backend.Version})
+}
+
+func (a *API) listQueueBackends(w http.ResponseWriter, r *http.Request) {
+	if !requireRole(w, r, "admin") {
+		return
+	}
+	rows, err := a.Store.Pool.Query(r.Context(), `SELECT id,name,backend_type,capabilities,status,row_version,created_at FROM queue_backends WHERE deleted_at IS NULL ORDER BY created_at DESC,id DESC`)
+	if err != nil {
+		handleErr(w, r, err)
+		return
+	}
+	defer rows.Close()
+	items := make([]map[string]any, 0)
+	for rows.Next() {
+		var id uuid.UUID
+		var name, kind, status string
+		var capabilities json.RawMessage
+		var version int64
+		var created time.Time
+		if err = rows.Scan(&id, &name, &kind, &capabilities, &status, &version, &created); err != nil {
+			handleErr(w, r, err)
+			return
+		}
+		items = append(items, map[string]any{"id": id, "name": name, "backend_type": kind, "capabilities": capabilities, "status": status, "version": version, "created_at": created})
+	}
+	if err = rows.Err(); err != nil {
+		handleErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
 func (a *API) createQueue(w http.ResponseWriter, r *http.Request) {
 	if !requireRole(w, r, "admin") {
 		return

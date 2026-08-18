@@ -132,7 +132,11 @@ func Run(ctx context.Context, pool *pgxpool.Pool, migrations []Migration, opts O
 	}
 
 	var hasSchema bool
-	if err = conn.QueryRow(ctx, "SELECT to_regclass('job_runs') IS NOT NULL").Scan(&hasSchema); err != nil {
+	if err = conn.QueryRow(ctx, `SELECT EXISTS(
+		SELECT 1 FROM pg_catalog.pg_class c
+		JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
+		WHERE n.nspname=current_schema() AND c.relname='job_runs' AND c.relkind IN ('r','p')
+	)`).Scan(&hasSchema); err != nil {
 		return Result{}, fmt.Errorf("inspect existing schema: %w", err)
 	}
 	result := Result{}

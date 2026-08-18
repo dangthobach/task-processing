@@ -16,3 +16,8 @@ groups:
         for: 5m
         labels: {severity: warning}
         annotations: {summary: "Task outbox cannot reach its backend"}
+      - alert: TaskMaintenanceFailures
+        expr: increase(task_maintenance_failures_total[10m]) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "Task worker maintenance/reconciliation is failing"}

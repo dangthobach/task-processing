@@ -44,7 +44,10 @@ func main() {
 	if err = tx.QueryRow(ctx, "SELECT id FROM permissions WHERE permission_key='platform:admin'").Scan(&permission); err != nil {
 		panic(err)
 	}
-	if _, err = tx.Exec(ctx, "INSERT INTO user_roles(user_id,role_id) VALUES($1,$2); INSERT INTO role_permissions(role_id,permission_id) VALUES($2,$3)", user, role, permission); err != nil {
+	if _, err = tx.Exec(ctx, "INSERT INTO user_roles(user_id,role_id) VALUES($1,$2)", user, role); err != nil {
+		panic(err)
+	}
+	if _, err = tx.Exec(ctx, "INSERT INTO role_permissions(role_id,permission_id) VALUES($1,$2)", role, permission); err != nil {
 		panic(err)
 	}
 	if err = tx.Commit(ctx); err != nil {

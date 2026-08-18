@@ -30,7 +30,15 @@ func main() {
 	}
 	defer store.Close()
 	api := &httpapi.API{Store: store, Events: httpapi.NewEventHub()}
-	if os.Getenv("TASK_DEV_HEADER_IDENTITY") == "true" { api.Identity = identity.HeaderProvider{} }
+	if os.Getenv("TASK_DEV_HEADER_IDENTITY") == "true" {
+		api.Identity = identity.HeaderProvider{}
+	} else if issuer := os.Getenv("TASK_OIDC_ISSUER"); issuer != "" {
+		provider, providerErr := identity.NewOIDC(ctx, identity.OIDCConfig{Issuer: issuer, Audience: os.Getenv("TASK_OIDC_AUDIENCE"), TenantClaim: os.Getenv("TASK_OIDC_TENANT_CLAIM"), RoleClaim: os.Getenv("TASK_OIDC_ROLE_CLAIM")})
+		if providerErr != nil {
+			panic(providerErr)
+		}
+		api.Identity = provider
+	}
 	srv := &http.Server{Addr: ":8080", Handler: api.Router(), ReadHeaderTimeout: 5 * time.Second}
 	go func() {
 		<-ctx.Done()

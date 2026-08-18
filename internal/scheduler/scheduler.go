@@ -42,7 +42,7 @@ func (s *Service) Run(ctx context.Context) error {
 	defer conn.Release()
 	var leader bool
 	for !leader {
-		if err = conn.QueryRow(ctx, "SELECT pg_try_advisory_lock(hashtext('task-processing-scheduler-leader'))").Scan(&leader); err != nil {
+		if err = conn.QueryRow(ctx, "SELECT pg_try_advisory_lock(hashtextextended('task-processing-scheduler-leader', 0))").Scan(&leader); err != nil {
 			return err
 		}
 		if !leader {
@@ -54,7 +54,7 @@ func (s *Service) Run(ctx context.Context) error {
 			}
 		}
 	}
-	defer conn.Exec(context.Background(), "SELECT pg_advisory_unlock(hashtext('task-processing-scheduler-leader'))")
+	defer conn.Exec(context.Background(), "SELECT pg_advisory_unlock(hashtextextended('task-processing-scheduler-leader', 0))")
 	s.Log.Info("scheduler leader elected", "instance_id", s.InstanceID)
 	sch, err := gocron.NewScheduler()
 	if err != nil {
@@ -73,6 +73,12 @@ func (s *Service) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return sch.Shutdown()
 		case <-ticker.C:
+			// Advisory locks are connection-scoped. Fail closed if that dedicated
+			// connection is no longer healthy; a supervisor can restart this
+			// instance and a standby then becomes leader.
+			if _, pingErr := conn.Exec(ctx, "SELECT 1"); pingErr != nil {
+				return fmt.Errorf("scheduler leader connection lost: %w", pingErr)
+			}
 			if reconcileErr := s.reconcile(ctx, sch, registry, &registryMu); reconcileErr != nil && !errors.Is(reconcileErr, context.Canceled) {
 				s.Log.Error("schedule reconciliation failed", "error", reconcileErr)
 			}

@@ -4,6 +4,7 @@ import (
 	"context"
 	"github.com/example/task-processing/internal/domain/job"
 	"github.com/example/task-processing/internal/persistence/postgres"
+	"github.com/example/task-processing/internal/queuebackend"
 	"github.com/example/task-processing/internal/registry"
 	"github.com/example/task-processing/internal/telemetry"
 	"github.com/example/task-processing/internal/worker"
@@ -47,6 +48,10 @@ func main() {
 		panic(err)
 	}
 	defer store.Close()
+	backends, err := queuebackend.FromEnv(store, os.Getenv)
+	if err != nil {
+		panic(err)
+	}
 	config, err := worker.LoadConfig(os.Getenv)
 	if err != nil {
 		panic(err)
@@ -71,7 +76,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	w := &worker.Worker{Store: store, Registry: reg, ID: workerID, Owner: id.String(), Config: config, Log: slog.Default()}
+	w := &worker.Worker{Store: store, Registry: reg, ID: workerID, Owner: id.String(), Config: config, Backends: backends, Log: slog.Default()}
 	if err = w.Run(ctx); err != nil && ctx.Err() == nil {
 		panic(err)
 	}

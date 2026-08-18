@@ -24,6 +24,15 @@ var (
 	ErrInvalidMessage = errors.New("queue message is invalid")
 )
 
+// TransportAckError means PostgreSQL already accepted the terminal transition
+// but the broker acknowledgement was not confirmed. Callers may continue
+// durable follow-up work; the broker will redeliver and the ownership fence
+// will discard the duplicate safely.
+type TransportAckError struct{ Err error }
+
+func (e *TransportAckError) Error() string { return "transport acknowledgement: " + e.Err.Error() }
+func (e *TransportAckError) Unwrap() error { return e.Err }
+
 // Capabilities tell the control plane which feature must be emulated instead
 // of assuming vendor primitives exist.
 type Capabilities struct {
@@ -55,6 +64,10 @@ type Delivery struct {
 	Message   Message       `json:"message"`
 	Execution job.Execution `json:"execution"`
 	Owner     string        `json:"-"`
+	// Receipt is transport-specific acknowledgement metadata. It is opaque to
+	// callers and never persisted as job state; PostgreSQL delivery leaves it
+	// empty while stream adapters store the stream/message sequence here.
+	Receipt string `json:"-"`
 }
 
 type QueueStats struct {
