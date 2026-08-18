@@ -1,0 +1,6 @@
+.env
+bin/
+coverage.out
+tmp/
+frontend/node_modules/
+frontend/dist/

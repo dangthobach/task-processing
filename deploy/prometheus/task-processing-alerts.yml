@@ -1,0 +1,18 @@
+groups:
+  - name: task-processing
+    rules:
+      - alert: TaskQueueLatencyHigh
+        expr: task_queue_oldest_age_seconds > 300
+        for: 10m
+        labels: {severity: warning}
+        annotations: {summary: "Queue has work older than five minutes"}
+      - alert: TaskWorkerOffline
+        expr: task_worker_heartbeat_age_seconds > 30
+        for: 2m
+        labels: {severity: critical}
+        annotations: {summary: "Worker heartbeat is stale"}
+      - alert: TaskOutboxFailures
+        expr: increase(task_outbox_failures_total[10m]) > 0
+        for: 5m
+        labels: {severity: warning}
+        annotations: {summary: "Task outbox cannot reach its backend"}
