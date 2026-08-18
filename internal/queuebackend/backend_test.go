@@ -32,7 +32,7 @@ func TestMessageRequiresStableControlPlaneIDs(t *testing.T) {
 	if err := (Message{}).Validate(); err != ErrInvalidMessage {
 		t.Fatalf("err=%v", err)
 	}
-	if err := (Message{RunID: uuid.New(), ProjectID: uuid.New(), QueueID: uuid.New()}).Validate(); err != nil {
+	if err := (Message{DispatchID: uuid.New(), RunID: uuid.New(), ProjectID: uuid.New(), QueueID: uuid.New()}).Validate(); err != nil {
 		t.Fatal(err)
 	}
 }

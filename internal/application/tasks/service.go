@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/example/task-processing/internal/domain/job"
@@ -166,6 +167,10 @@ func (s Schedules) Create(ctx context.Context, in ScheduleInput) (uuid.UUID, err
 	}
 	if in.Timezone == "" {
 		in.Timezone = "UTC"
+	}
+	upperCron := strings.ToUpper(strings.TrimSpace(in.Cron))
+	if strings.HasPrefix(upperCron, "TZ=") || strings.HasPrefix(upperCron, "CRON_TZ=") {
+		return uuid.Nil, fmt.Errorf("%w: cron expression must not include a timezone prefix", ErrInvalidInput)
 	}
 	if _, err := time.LoadLocation(in.Timezone); err != nil {
 		return uuid.Nil, fmt.Errorf("%w: timezone: %v", ErrInvalidInput, err)

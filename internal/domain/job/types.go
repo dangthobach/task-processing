@@ -79,6 +79,8 @@ type Run struct {
 	Policy          PolicySnapshot  `json:"policy"`
 	ScheduledFor    *time.Time      `json:"scheduled_for,omitempty"`
 	AttemptNumber   int             `json:"attempt_number,omitempty"`
+	LeaseToken      uuid.UUID       `json:"-"`
+	DispatchID      uuid.UUID       `json:"-"`
 }
 type Execution struct {
 	RunID           uuid.UUID
@@ -90,6 +92,8 @@ type Execution struct {
 	FunctionKey     string
 	FunctionVersion string
 	IdempotencyKey  string
+	LeaseToken      uuid.UUID
+	LeaseExpiresAt  time.Time
 	Payload         json.RawMessage
 	Policy          PolicySnapshot
 	Attempt         int
@@ -214,12 +218,25 @@ func Retryable(class ErrorClass, p RetryPolicy) bool {
 		return true
 	}
 }
-func MustPayload(raw json.RawMessage) json.RawMessage {
+
+// NormalizePayload converts an omitted payload to an empty JSON object and
+// rejects malformed JSON. It deliberately never panics because payloads are
+// untrusted HTTP input.
+func NormalizePayload(raw json.RawMessage) (json.RawMessage, error) {
 	if len(raw) == 0 {
-		return json.RawMessage(`{}`)
+		return json.RawMessage(`{}`), nil
 	}
 	if !json.Valid(raw) {
-		panic(fmt.Sprintf("invalid JSON payload: %s", raw))
+		return nil, fmt.Errorf("invalid JSON payload")
 	}
-	return raw
+	return raw, nil
+}
+
+// DecodePayload decodes a normalized payload for a typed handler.
+func DecodePayload[T any](raw json.RawMessage) (T, error) {
+	var value T
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return value, err
+	}
+	return value, nil
 }

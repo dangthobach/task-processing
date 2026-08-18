@@ -26,65 +26,114 @@ type Worker struct {
 	Owner       string
 	Concurrency int
 	Lease       time.Duration
+	Config      Config
 	Log         *slog.Logger
 	Middleware  []workermiddleware.Middleware
 	Backends    *queuebackend.Registry
 }
 
 func (w *Worker) Run(ctx context.Context) error {
-	if w.Concurrency < 1 {
-		w.Concurrency = 1
+	cfg := w.Config
+	if cfg.Concurrency == 0 {
+		cfg = DefaultConfig()
 	}
-	if w.Lease <= 0 {
-		w.Lease = 60 * time.Second
+	if w.Concurrency > 0 {
+		cfg.Concurrency = w.Concurrency
 	}
+	if w.Lease > 0 {
+		cfg.Lease = w.Lease
+	}
+	w.Concurrency, w.Lease = cfg.Concurrency, cfg.Lease
 	if w.Backends == nil {
 		w.Backends = queuebackend.NewRegistry(queuebackend.NewPostgres(w.Store))
 	}
-	ticker := time.NewTicker(250 * time.Millisecond)
-	defer ticker.Stop()
-	heartbeat := time.NewTicker(10 * time.Second)
+	// Stop claiming immediately on shutdown but let in-flight handlers finish
+	// during the drain window. Their context is cancelled only after that window.
+	workCtx, cancelWork := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelWork()
+	claimTicker := time.NewTicker(cfg.Intervals.Claim)
+	defer claimTicker.Stop()
+	outboxTicker := time.NewTicker(cfg.Intervals.Outbox)
+	defer outboxTicker.Stop()
+	auditTicker := time.NewTicker(cfg.Intervals.AuditOutbox)
+	defer auditTicker.Stop()
+	retryTicker := time.NewTicker(cfg.Intervals.RetryPromotion)
+	defer retryTicker.Stop()
+	leaseTicker := time.NewTicker(cfg.Intervals.LeaseRecovery)
+	defer leaseTicker.Stop()
+	batchTicker := time.NewTicker(cfg.Intervals.BatchRecovery)
+	defer batchTicker.Stop()
+	heartbeat := time.NewTicker(cfg.Intervals.Heartbeat)
 	defer heartbeat.Stop()
 	defer w.Store.SetWorkerStatus(context.Background(), w.ID, "OFFLINE")
-	sem := make(chan struct{}, w.Concurrency)
+	slots := newSlots(cfg.Concurrency)
 	var wg sync.WaitGroup
-	defer wg.Wait()
 	for {
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			done := make(chan struct{})
+			go func() { wg.Wait(); close(done) }()
+			select {
+			case <-done:
+				return ctx.Err()
+			case <-time.After(cfg.DrainTimeout):
+				cancelWork()
+				select {
+				case <-done:
+					return fmt.Errorf("worker drain timed out after %s", cfg.DrainTimeout)
+				case <-time.After(5 * time.Second):
+					return fmt.Errorf("worker handlers did not stop after drain cancellation")
+				}
+			}
 		case <-heartbeat.C:
 			if err := w.Store.Heartbeat(ctx, w.ID); err != nil {
 				w.Log.Error("worker heartbeat failed", "error", err)
 			}
 			w.refreshMetrics(ctx)
-		case <-ticker.C:
+		case <-outboxTicker.C:
 			w.dispatchOutbox(ctx)
+		case <-auditTicker.C:
 			_, _ = w.Store.DispatchAuditOutbox(ctx, 100)
+		case <-retryTicker.C:
 			_, _ = w.Store.PromoteRetries(ctx)
+		case <-batchTicker.C:
 			_, _ = w.Store.RecoverExpiredBatches(ctx)
+		case <-leaseTicker.C:
 			_, _ = w.Store.RecoverExpiredLeases(ctx)
-			capacity := w.Concurrency - len(sem)
+		case <-claimTicker.C:
+			capacity := slots.ReserveAvailable()
+			if capacity == 0 {
+				continue
+			}
 			batches, err := w.Store.ClaimBatches(ctx, w.ID, w.Owner, capacity, w.Lease)
 			if err != nil {
 				w.Log.Error("batch claim failed", "error", err)
+				slots.ReleaseUnused(capacity)
+				continue
 			}
 			for _, batchID := range batches {
-				sem <- struct{}{}
 				wg.Add(1)
-				go func(id uuid.UUID) { defer func() { <-sem; wg.Done() }(); w.executeBatch(ctx, id) }(batchID)
+				go func(id uuid.UUID) { defer func() { slots.Release(1); wg.Done() }(); w.executeBatch(workCtx, id) }(batchID)
 			}
-			capacity = w.Concurrency - len(sem)
+			slots.ReleaseUnused(capacity - len(batches))
+			capacity = slots.ReserveAvailable()
+			if capacity == 0 {
+				continue
+			}
 			runs, err := w.Store.Claim(ctx, w.ID, w.Owner, capacity, w.Lease)
 			if err != nil {
 				w.Log.Error("claim failed", "error", err)
+				slots.ReleaseUnused(capacity)
 				continue
 			}
 			for _, r := range runs {
-				sem <- struct{}{}
 				wg.Add(1)
-				go func(r job.Run) { defer func() { <-sem; wg.Done() }(); w.execute(ctx, r.ID) }(r)
+				go func(r job.Run) {
+					defer func() { slots.Release(1); wg.Done() }()
+					w.execute(workCtx, r.ID, r.LeaseToken)
+				}(r)
 			}
+			slots.ReleaseUnused(capacity - len(runs))
 		}
 	}
 }
@@ -103,7 +152,7 @@ func (w *Worker) refreshMetrics(parent context.Context) {
 }
 
 func (w *Worker) dispatchOutbox(ctx context.Context) {
-	items, err := w.Store.PendingOutbox(ctx, 100)
+	items, err := w.Store.ClaimOutbox(ctx, w.Owner, 100, w.Lease)
 	if err != nil {
 		w.Log.Error("outbox query failed", "error", err)
 		return
@@ -111,15 +160,15 @@ func (w *Worker) dispatchOutbox(ctx context.Context) {
 	for _, item := range items {
 		backend, lookupErr := w.Backends.Get(queuebackend.Type(item.BackendType))
 		if lookupErr == nil {
-			lookupErr = backend.Enqueue(ctx, queuebackend.Message{RunID: item.RunID, ProjectID: item.ProjectID, QueueID: item.QueueID, Priority: job.Priority(item.Priority), AvailableAt: item.AvailableAt, Payload: item.Payload})
+			lookupErr = backend.Enqueue(ctx, queuebackend.Message{DispatchID: item.DispatchID, RunID: item.RunID, ProjectID: item.ProjectID, QueueID: item.QueueID, Priority: job.Priority(item.Priority), AvailableAt: item.AvailableAt})
 		}
 		if lookupErr != nil {
 			telemetry.Metrics.OutboxFailures.Inc()
-			_ = w.Store.RecordOutboxFailure(ctx, item.ID, lookupErr)
+			_ = w.Store.RecordOutboxFailure(ctx, item.ID, item.Token, lookupErr)
 			w.Log.Error("outbox enqueue failed", "outbox_id", item.ID, "run_id", item.RunID, "backend", item.BackendType, "error", lookupErr)
 			continue
 		}
-		if err = w.Store.MarkOutboxPublished(ctx, item.ID); err != nil {
+		if err = w.Store.MarkOutboxPublished(ctx, item.ID, item.Token); err != nil {
 			w.Log.Error("outbox publish acknowledgement failed", "outbox_id", item.ID, "error", err)
 		}
 	}
@@ -180,17 +229,20 @@ func (w *Worker) ReportBatchProgress(ctx context.Context, b *job.BatchExecution,
 func (w *Worker) WriteBatchLog(ctx context.Context, b *job.BatchExecution, level, message string, fields map[string]any) error {
 	return w.Store.WriteBatchLog(ctx, b, level, message, fields)
 }
-func (w *Worker) execute(parent context.Context, runID uuid.UUID) {
+func (w *Worker) execute(parent context.Context, runID, token uuid.UUID) {
 	spanCtx, span := otel.Tracer("task-processing/worker").Start(parent, "task.attempt", trace.WithAttributes(attribute.String("task.run_id", runID.String())))
 	defer span.End()
-	ex, err := w.Store.StartAttempt(spanCtx, runID, w.ID, w.Owner, w.Lease)
+	ex, err := w.Store.StartAttempt(spanCtx, runID, w.ID, w.Owner, token, w.Lease)
 	if err != nil {
 		if errors.Is(err, postgres.ErrConcurrencyLimited) {
-			_ = w.Store.ReleaseReservation(parent, runID, w.Owner)
+			_ = w.Store.ReleaseReservation(parent, runID, w.Owner, token)
 			return
 		}
 		if errors.Is(err, postgres.ErrRateLimited) {
-			_ = w.Store.ReleaseReservation(parent, runID, w.Owner)
+			_ = w.Store.ReleaseReservation(parent, runID, w.Owner, token)
+			return
+		}
+		if errors.Is(err, postgres.ErrLeaseLost) {
 			return
 		}
 		w.Log.Error("start attempt failed", "run_id", runID, "error", err)
@@ -202,18 +254,27 @@ func (w *Worker) execute(parent context.Context, runID uuid.UUID) {
 	defer telemetry.Metrics.Inflight.Dec()
 	span.SetAttributes(attribute.String("task.function", ex.FunctionKey), attribute.Int("task.attempt", ex.Attempt))
 	h, err := w.Registry.Get(ex.FunctionKey)
+	jobCtx, cancelJob := context.WithCancelCause(spanCtx)
+	defer cancelJob(nil)
 	if err == nil {
-		ctx, cancel := context.WithTimeout(spanCtx, time.Duration(ex.Policy.TimeoutMS)*time.Millisecond)
+		ctx, cancel := context.WithTimeout(jobCtx, time.Duration(ex.Policy.TimeoutMS)*time.Millisecond)
 		defer cancel()
 		stopLease := make(chan struct{})
 		defer close(stopLease)
-		go w.renewLease(ctx, runID, stopLease)
+		go w.renewLease(ctx, ex, stopLease, cancelJob)
 		h = workermiddleware.Chain(h, append([]workermiddleware.Middleware{workermiddleware.Recover, workermiddleware.StructuredLog(w.Log)}, w.Middleware...)...)
 		err = h(job.NewExecutionContext(ctx, &ex, w))
+	}
+	if errors.Is(context.Cause(jobCtx), postgres.ErrLeaseLost) {
+		w.Log.Warn("job abandoned because its lease was lost", "run_id", runID)
+		return
 	}
 	if err == nil {
 		err = w.Store.CompleteSuccess(spanCtx, ex, w.Owner)
 		if err != nil {
+			if errors.Is(err, postgres.ErrLeaseLost) {
+				return
+			}
 			w.Log.Error("complete success failed", "run_id", runID, "error", err)
 		} else if err = w.Store.AdvanceWorkflowForJob(spanCtx, ex.RunID, true); err != nil {
 			w.Log.Error("advance workflow failed", "run_id", runID, "error", err)
@@ -225,6 +286,9 @@ func (w *Worker) execute(parent context.Context, runID uuid.UUID) {
 	c := job.Classify(err)
 	span.RecordError(err)
 	if e := w.Store.CompleteFailure(spanCtx, ex, w.Owner, c, ex.Policy.Retry, time.Now()); e != nil {
+		if errors.Is(e, postgres.ErrLeaseLost) {
+			return
+		}
 		w.Log.Error("complete failure failed", "run_id", runID, "error", e)
 	} else if ex.Attempt >= ex.Policy.Retry.MaxAttempts || !job.Retryable(c.Class, ex.Policy.Retry) {
 		if advanceErr := w.Store.AdvanceWorkflowForJob(spanCtx, ex.RunID, false); advanceErr != nil {
@@ -248,23 +312,56 @@ func (w *Worker) writeJobLog(ctx context.Context, ex job.Execution, level, messa
 func (w *Worker) ReportProgress(ctx context.Context, ex *job.Execution, percent int, message string) error {
 	return w.Store.ReportProgress(ctx, ex, w.Owner, percent, message)
 }
-func (w *Worker) renewLease(ctx context.Context, runID uuid.UUID, stop <-chan struct{}) {
+func (w *Worker) renewLease(ctx context.Context, ex job.Execution, stop <-chan struct{}, cancel context.CancelCauseFunc) {
 	interval := w.Lease / 3
+	safety := w.Lease / 6
 	if interval < time.Second {
 		interval = time.Second
 	}
-	t := time.NewTicker(interval)
-	defer t.Stop()
+	if safety < 250*time.Millisecond {
+		safety = 250 * time.Millisecond
+	}
+	expiresAt := ex.LeaseExpiresAt
+	retryDelay := time.Duration(0)
 	for {
+		deadline := expiresAt.Add(-safety)
+		wait := interval
+		if retryDelay > 0 {
+			wait = retryDelay
+		}
+		if remaining := time.Until(deadline); remaining <= 0 {
+			cancel(postgres.ErrLeaseLost)
+			return
+		} else if wait > remaining {
+			wait = remaining
+		}
+		timer := time.NewTimer(wait)
 		select {
 		case <-stop:
+			timer.Stop()
 			return
 		case <-ctx.Done():
+			timer.Stop()
 			return
-		case <-t.C:
-			if err := w.Store.ExtendLease(ctx, runID, w.Owner, w.Lease); err != nil {
-				w.Log.Error("lease renewal failed", "run_id", runID, "error", err)
+		case <-timer.C:
+			newExpiry, err := w.Store.ExtendLease(ctx, ex.RunID, w.Owner, ex.LeaseToken, w.Lease)
+			if err == nil {
+				expiresAt = newExpiry
+				retryDelay = 0
+				continue
+			}
+			if errors.Is(err, postgres.ErrLeaseLost) {
+				cancel(postgres.ErrLeaseLost)
 				return
+			}
+			w.Log.Warn("lease renewal failed; retrying within lease budget", "run_id", ex.RunID, "error", err)
+			if retryDelay == 0 {
+				retryDelay = 100 * time.Millisecond
+			} else {
+				retryDelay *= 2
+			}
+			if retryDelay > time.Second {
+				retryDelay = time.Second
 			}
 		}
 	}

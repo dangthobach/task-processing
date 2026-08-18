@@ -47,6 +47,10 @@ func main() {
 		panic(err)
 	}
 	defer store.Close()
+	config, err := worker.LoadConfig(os.Getenv)
+	if err != nil {
+		panic(err)
+	}
 	reg := registry.New()
 	reg.Register("example.echo", func(e *job.ExecutionContext) error {
 		slog.Info("echo handled", "run_id", e.Execution.RunID, "payload", string(e.Execution.Payload))
@@ -67,7 +71,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
-	w := &worker.Worker{Store: store, Registry: reg, ID: workerID, Owner: id.String(), Concurrency: 10, Log: slog.Default()}
+	w := &worker.Worker{Store: store, Registry: reg, ID: workerID, Owner: id.String(), Config: config, Log: slog.Default()}
 	if err = w.Run(ctx); err != nil && ctx.Err() == nil {
 		panic(err)
 	}

@@ -3,10 +3,11 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/example/task-processing/internal/migration"
 	"github.com/example/task-processing/internal/persistence/postgres"
+	"github.com/example/task-processing/migrations"
 	"os"
-	"path/filepath"
-	"sort"
+	"strconv"
 )
 
 func main() {
@@ -20,19 +21,25 @@ func main() {
 		panic(err)
 	}
 	defer store.Close()
-	files, err := filepath.Glob("migrations/*.sql")
+	baseline := int64(0)
+	if raw := os.Getenv("MIGRATION_BASELINE_THROUGH"); raw != "" {
+		baseline, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || baseline < 0 {
+			panic("MIGRATION_BASELINE_THROUGH must be a non-negative integer")
+		}
+	}
+	loaded, err := migration.Load(migrations.FS)
 	if err != nil {
 		panic(err)
 	}
-	sort.Strings(files)
-	for _, f := range files {
-		b, e := os.ReadFile(f)
-		if e != nil {
-			panic(e)
-		}
-		if _, e = store.Pool.Exec(ctx, string(b)); e != nil {
-			panic(fmt.Errorf("%s: %w", f, e))
-		}
-		fmt.Println("applied", f)
+	result, err := migration.Run(ctx, store.Pool, loaded, migration.Options{BaselineThrough: baseline})
+	if err != nil {
+		panic(err)
+	}
+	for _, version := range result.Baselined {
+		fmt.Println("baselined", version)
+	}
+	for _, version := range result.Applied {
+		fmt.Println("applied", version)
 	}
 }

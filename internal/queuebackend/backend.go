@@ -4,7 +4,6 @@ package queuebackend
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"time"
 
@@ -37,12 +36,12 @@ type Capabilities struct {
 }
 
 type Message struct {
-	RunID       uuid.UUID       `json:"run_id"`
-	ProjectID   uuid.UUID       `json:"project_id"`
-	QueueID     uuid.UUID       `json:"queue_id"`
-	Priority    job.Priority    `json:"priority"`
-	AvailableAt time.Time       `json:"available_at"`
-	Payload     json.RawMessage `json:"payload,omitempty"`
+	DispatchID  uuid.UUID    `json:"dispatch_id"`
+	RunID       uuid.UUID    `json:"run_id"`
+	ProjectID   uuid.UUID    `json:"project_id"`
+	QueueID     uuid.UUID    `json:"queue_id"`
+	Priority    job.Priority `json:"priority"`
+	AvailableAt time.Time    `json:"available_at"`
 }
 
 type ReserveRequest struct {
@@ -80,7 +79,7 @@ type Backend interface {
 }
 
 func (m Message) Validate() error {
-	if m.RunID == uuid.Nil || m.ProjectID == uuid.Nil || m.QueueID == uuid.Nil {
+	if m.DispatchID == uuid.Nil || m.RunID == uuid.Nil || m.ProjectID == uuid.Nil || m.QueueID == uuid.Nil {
 		return ErrInvalidMessage
 	}
 	return nil

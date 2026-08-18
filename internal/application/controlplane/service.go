@@ -145,8 +145,13 @@ func ValidatePatch(resource string, patch Patch) error {
 }
 
 func ValidateScheduleExpression(expression, timezoneName string, withSeconds bool) error {
-	if strings.TrimSpace(expression) == "" {
+	expression = strings.TrimSpace(expression)
+	if expression == "" {
 		return fmt.Errorf("cron_expression is required")
+	}
+	upper := strings.ToUpper(expression)
+	if strings.HasPrefix(upper, "TZ=") || strings.HasPrefix(upper, "CRON_TZ=") {
+		return fmt.Errorf("cron_expression must not include a timezone prefix")
 	}
 	if _, err := time.LoadLocation(timezoneName); err != nil {
 		return fmt.Errorf("timezone is invalid")

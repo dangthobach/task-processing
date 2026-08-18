@@ -9,7 +9,6 @@ import (
 	"github.com/example/task-processing/internal/security/kms"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"time"
 )
@@ -64,11 +63,21 @@ type Submit struct {
 	Priority                *job.Priority
 	ScheduleID              *uuid.UUID
 	ScheduledFor            *time.Time
+	// Snapshot is used by immutable workflow runtime nodes. It carries the
+	// execution values captured at workflow start instead of re-reading a
+	// mutable retry policy or job definition at downstream dispatch time.
+	Snapshot *Definition
 }
 
 func (s *Store) Submit(ctx context.Context, input Submit) (job.Run, error) {
-	d, err := s.Definition(ctx, input.DefinitionID, input.ProjectID)
-	if err != nil {
+	d := Definition{}
+	var err error
+	if input.Snapshot != nil {
+		d = *input.Snapshot
+		if d.ID != input.DefinitionID || d.ProjectID != input.ProjectID {
+			return job.Run{}, errors.New("execution snapshot does not match submit target")
+		}
+	} else if d, err = s.Definition(ctx, input.DefinitionID, input.ProjectID); err != nil {
 		return job.Run{}, err
 	}
 	qstatus := ""
@@ -82,7 +91,10 @@ func (s *Store) Submit(ctx context.Context, input Submit) (job.Run, error) {
 	if input.Priority != nil {
 		priority = *input.Priority
 	}
-	payload := job.MustPayload(input.Payload)
+	payload, err := job.NormalizePayload(input.Payload)
+	if err != nil {
+		return job.Run{}, err
+	}
 	storedPayload, ciphertext, keyRef, err := s.sealPayload(ctx, input.ProjectID, d.ID, payload)
 	if err != nil {
 		return job.Run{}, err
@@ -93,31 +105,101 @@ func (s *Store) Submit(ctx context.Context, input Submit) (job.Run, error) {
 		return job.Run{}, err
 	}
 	defer tx.Rollback(ctx)
-	id := uuid.New()
-	_, err = tx.Exec(ctx, `INSERT INTO job_runs(id,project_id,job_definition_id,queue_id,schedule_id,idempotency_key,status,priority,scheduled_for,payload,payload_ciphertext,encryption_key_ref,function_version,policy_snapshot) VALUES($1,$2,$3,$4,$5,NULLIF($6,''),'ENQUEUE_PENDING',$7,$8,$9,$10,NULLIF($11,''),$12,$13)`, id, input.ProjectID, d.ID, d.QueueID, input.ScheduleID, input.IdempotencyKey, priority, input.ScheduledFor, storedPayload, ciphertext, keyRef, d.FunctionVersion, policy)
+	run, created, err := insertIdempotentRun(ctx, tx, input, d, priority, storedPayload, ciphertext, keyRef, policy)
 	if err != nil {
-		if isUnique(err) {
-			var existing job.Run
-			var e error
-			if input.IdempotencyKey != "" {
-				e = tx.QueryRow(ctx, "SELECT id,status FROM job_runs WHERE project_id=$1 AND idempotency_key=$2", input.ProjectID, input.IdempotencyKey).Scan(&existing.ID, &existing.Status)
-			} else if input.ScheduleID != nil && input.ScheduledFor != nil {
-				e = tx.QueryRow(ctx, "SELECT id,status FROM job_runs WHERE schedule_id=$1 AND scheduled_for=$2", input.ScheduleID, input.ScheduledFor).Scan(&existing.ID, &existing.Status)
-			}
-			if e == nil {
-				return existing, tx.Commit(ctx)
-			}
-		}
 		return job.Run{}, err
 	}
-	_, err = tx.Exec(ctx, `INSERT INTO outbox_events(project_id,event_type,aggregate_id,payload) VALUES($1,'job.enqueue',$2,jsonb_build_object('run_id',$2))`, input.ProjectID, id)
-	if err != nil {
-		return job.Run{}, err
+	if created {
+		if _, err = tx.Exec(ctx, `INSERT INTO outbox_events(project_id,event_type,aggregate_id,dispatch_id,payload) VALUES($1,'job.enqueue',$2,$3,jsonb_build_object('run_id',$2,'dispatch_id',$3))`, input.ProjectID, run.ID, run.DispatchID); err != nil {
+			return job.Run{}, err
+		}
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return job.Run{}, err
 	}
-	return job.Run{ID: id, ProjectID: input.ProjectID, DefinitionID: d.ID, QueueID: d.QueueID, Status: job.EnqueuePending, Priority: priority, Payload: payload, Policy: d.Policy, FunctionKey: d.FunctionKey, FunctionVersion: d.FunctionVersion, IdempotencyKey: input.IdempotencyKey}, nil
+	if !created {
+		return run, nil
+	}
+	return job.Run{ID: run.ID, ProjectID: input.ProjectID, DefinitionID: d.ID, QueueID: d.QueueID, Status: job.EnqueuePending, Priority: priority, Payload: payload, Policy: d.Policy, FunctionKey: d.FunctionKey, FunctionVersion: d.FunctionVersion, IdempotencyKey: input.IdempotencyKey, DispatchID: run.DispatchID}, nil
+}
+
+const insertRunSQL = `INSERT INTO job_runs(id,project_id,job_definition_id,queue_id,schedule_id,idempotency_key,status,priority,scheduled_for,payload,payload_ciphertext,encryption_key_ref,function_version,policy_snapshot,current_dispatch_id)
+VALUES($1,$2,$3,$4,$5,NULLIF($6,''),'ENQUEUE_PENDING',$7,$8,$9,$10,NULLIF($11,''),$12,$13,$14)`
+
+// insertIdempotentRun deliberately uses separate INSERT and SELECT commands.
+// At READ COMMITTED PostgreSQL assigns a fresh snapshot to the second command,
+// which makes a row committed by the conflicting transaction visible. Keeping
+// the conflict targets separate avoids accidentally swallowing an unrelated
+// future unique constraint.
+func insertIdempotentRun(ctx context.Context, tx pgx.Tx, input Submit, definition Definition, priority job.Priority, payload json.RawMessage, ciphertext []byte, keyRef string, policy []byte) (job.Run, bool, error) {
+	if input.ScheduleID != nil || input.ScheduledFor != nil {
+		if input.ScheduleID == nil || input.ScheduledFor == nil {
+			return job.Run{}, false, errors.New("schedule_id and scheduled_for must be supplied together")
+		}
+		if input.IdempotencyKey != "" {
+			return job.Run{}, false, errors.New("scheduled occurrence cannot also carry an idempotency key")
+		}
+		return insertOccurrence(ctx, tx, input, definition, priority, payload, ciphertext, keyRef, policy)
+	}
+	if input.IdempotencyKey != "" {
+		return insertByIdempotencyKey(ctx, tx, input, definition, priority, payload, ciphertext, keyRef, policy)
+	}
+	var run job.Run
+	run.DispatchID = uuid.New()
+	err := tx.QueryRow(ctx, insertRunSQL+" RETURNING id,status,current_dispatch_id", uuid.New(), input.ProjectID, definition.ID, definition.QueueID, nil, "", priority, nil, payload, ciphertext, keyRef, definition.FunctionVersion, policy, run.DispatchID).Scan(&run.ID, &run.Status, &run.DispatchID)
+	return run, err == nil, err
+}
+
+func insertByIdempotencyKey(ctx context.Context, tx pgx.Tx, input Submit, definition Definition, priority job.Priority, payload json.RawMessage, ciphertext []byte, keyRef string, policy []byte) (job.Run, bool, error) {
+	var run job.Run
+	run.DispatchID = uuid.New()
+	err := tx.QueryRow(ctx, insertRunSQL+" ON CONFLICT (project_id,idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id,status,current_dispatch_id", uuid.New(), input.ProjectID, definition.ID, definition.QueueID, nil, input.IdempotencyKey, priority, nil, payload, ciphertext, keyRef, definition.FunctionVersion, policy, run.DispatchID).Scan(&run.ID, &run.Status, &run.DispatchID)
+	if err == nil {
+		return run, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return job.Run{}, false, err
+	}
+	return readExistingRun(ctx, tx, "SELECT id,status,current_dispatch_id FROM job_runs WHERE project_id=$1 AND idempotency_key=$2", input.ProjectID, input.IdempotencyKey)
+}
+
+func insertOccurrence(ctx context.Context, tx pgx.Tx, input Submit, definition Definition, priority job.Priority, payload json.RawMessage, ciphertext []byte, keyRef string, policy []byte) (job.Run, bool, error) {
+	var run job.Run
+	run.DispatchID = uuid.New()
+	err := tx.QueryRow(ctx, insertRunSQL+" ON CONFLICT (schedule_id,scheduled_for) WHERE schedule_id IS NOT NULL DO NOTHING RETURNING id,status,current_dispatch_id", uuid.New(), input.ProjectID, definition.ID, definition.QueueID, input.ScheduleID, "", priority, input.ScheduledFor, payload, ciphertext, keyRef, definition.FunctionVersion, policy, run.DispatchID).Scan(&run.ID, &run.Status, &run.DispatchID)
+	if err == nil {
+		return run, true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return job.Run{}, false, err
+	}
+	return readExistingRun(ctx, tx, "SELECT id,status,current_dispatch_id FROM job_runs WHERE schedule_id=$1 AND scheduled_for=$2", input.ScheduleID, input.ScheduledFor)
+}
+
+func readExistingRun(ctx context.Context, tx pgx.Tx, query string, args ...any) (job.Run, bool, error) {
+	// The bounded retry is defensive for a concurrent transaction that becomes
+	// visible immediately after ON CONFLICT resolves. Every query is a fresh
+	// READ COMMITTED statement snapshot; no transaction is left aborted.
+	for attempt := 0; attempt < 3; attempt++ {
+		var run job.Run
+		err := tx.QueryRow(ctx, query, args...).Scan(&run.ID, &run.Status, &run.DispatchID)
+		if err == nil {
+			return run, false, nil
+		}
+		if !errors.Is(err, pgx.ErrNoRows) {
+			return job.Run{}, false, err
+		}
+		if attempt < 2 {
+			timer := time.NewTimer(time.Duration(attempt+1) * time.Millisecond)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return job.Run{}, false, ctx.Err()
+			case <-timer.C:
+			}
+		}
+	}
+	return job.Run{}, false, errors.New("idempotency conflict row was not visible after bounded retry")
 }
 
 // SubmitBulk is atomic at the control-plane boundary: either every run/outbox intent exists or none do.
@@ -153,20 +235,23 @@ func (s *Store) SubmitBulk(ctx context.Context, inputs []Submit) ([]job.Run, err
 			priority = *in.Priority
 		}
 		id := uuid.New()
-		payload := job.MustPayload(in.Payload)
+		payload, normalizeErr := job.NormalizePayload(in.Payload)
+		if normalizeErr != nil {
+			return nil, normalizeErr
+		}
 		storedPayload, ciphertext, keyRef, sealErr := s.sealPayload(ctx, in.ProjectID, d.ID, payload)
 		if sealErr != nil {
 			return nil, sealErr
 		}
-		_, err = tx.Exec(ctx, `INSERT INTO job_runs(id,project_id,job_definition_id,queue_id,idempotency_key,status,priority,payload,payload_ciphertext,encryption_key_ref,function_version,policy_snapshot) VALUES($1,$2,$3,$4,NULLIF($5,''),'ENQUEUE_PENDING',$6,$7,$8,$9,NULLIF($10,''),$11,$12)`, id, in.ProjectID, d.ID, d.QueueID, in.IdempotencyKey, priority, storedPayload, ciphertext, keyRef, d.FunctionVersion, policy)
+		dispatchID := uuid.New()
+		_, err = tx.Exec(ctx, `INSERT INTO job_runs(id,project_id,job_definition_id,queue_id,idempotency_key,status,priority,payload,payload_ciphertext,encryption_key_ref,function_version,policy_snapshot,current_dispatch_id) VALUES($1,$2,$3,$4,NULLIF($5,''),'ENQUEUE_PENDING',$6,$7,$8,$9,NULLIF($10,''),$11,$12,$13)`, id, in.ProjectID, d.ID, d.QueueID, in.IdempotencyKey, priority, storedPayload, ciphertext, keyRef, d.FunctionVersion, policy, dispatchID)
 		if err != nil {
 			return nil, err
 		}
-		if _, err = tx.Exec(ctx, `INSERT INTO outbox_events(project_id,event_type,aggregate_id,payload) VALUES($1,'job.enqueue',$2,jsonb_build_object('run_id',$2))`, in.ProjectID, id); err != nil {
+		if _, err = tx.Exec(ctx, `INSERT INTO outbox_events(project_id,event_type,aggregate_id,dispatch_id,payload) VALUES($1,'job.enqueue',$2,$3,jsonb_build_object('run_id',$2,'dispatch_id',$3))`, in.ProjectID, id, dispatchID); err != nil {
 			return nil, err
 		}
-		runs = append(runs, job.Run{ID: id, ProjectID: in.ProjectID, DefinitionID: d.ID, QueueID: d.QueueID, Status: job.EnqueuePending, Priority: priority, Payload: payload, Policy: d.Policy, FunctionKey: d.FunctionKey, FunctionVersion: d.FunctionVersion, IdempotencyKey: in.IdempotencyKey})
+		runs = append(runs, job.Run{ID: id, ProjectID: in.ProjectID, DefinitionID: d.ID, QueueID: d.QueueID, Status: job.EnqueuePending, Priority: priority, Payload: payload, Policy: d.Policy, FunctionKey: d.FunctionKey, FunctionVersion: d.FunctionVersion, IdempotencyKey: in.IdempotencyKey, DispatchID: dispatchID})
 	}
 	return runs, tx.Commit(ctx)
 }
-func isUnique(err error) bool { var e *pgconn.PgError; return errors.As(err, &e) && e.Code == "23505" }

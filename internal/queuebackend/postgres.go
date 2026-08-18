@@ -24,17 +24,17 @@ func (b *PostgresBackend) Enqueue(ctx context.Context, message Message) error {
 	if err := message.Validate(); err != nil {
 		return err
 	}
-	return b.Store.EnqueueRuns(ctx, []uuid.UUID{message.RunID})
+	return b.Store.EnqueueDispatches(ctx, []store.DispatchRef{{RunID: message.RunID, DispatchID: message.DispatchID}})
 }
 func (b *PostgresBackend) EnqueueBatch(ctx context.Context, messages []Message) error {
-	ids := make([]uuid.UUID, 0, len(messages))
+	dispatches := make([]store.DispatchRef, 0, len(messages))
 	for _, message := range messages {
 		if err := message.Validate(); err != nil {
 			return err
 		}
-		ids = append(ids, message.RunID)
+		dispatches = append(dispatches, store.DispatchRef{RunID: message.RunID, DispatchID: message.DispatchID})
 	}
-	return b.Store.EnqueueRuns(ctx, ids)
+	return b.Store.EnqueueDispatches(ctx, dispatches)
 }
 func (b *PostgresBackend) Reserve(ctx context.Context, req ReserveRequest) ([]Delivery, error) {
 	if req.WorkerID == uuid.Nil || req.Owner == "" || req.Limit < 1 {
@@ -49,16 +49,16 @@ func (b *PostgresBackend) Reserve(ctx context.Context, req ReserveRequest) ([]De
 	}
 	deliveries := make([]Delivery, 0, len(runs))
 	for _, run := range runs {
-		execution, startErr := b.Store.StartAttempt(ctx, run.ID, req.WorkerID, req.Owner, req.Lease)
+		execution, startErr := b.Store.StartAttempt(ctx, run.ID, req.WorkerID, req.Owner, run.LeaseToken, req.Lease)
 		if errors.Is(startErr, store.ErrConcurrencyLimited) {
-			_ = b.Store.ReleaseReservation(ctx, run.ID, req.Owner)
+			_ = b.Store.ReleaseReservation(ctx, run.ID, req.Owner, run.LeaseToken)
 			continue
 		}
 		if startErr != nil {
-			_ = b.Store.ReleaseReservation(ctx, run.ID, req.Owner)
+			_ = b.Store.ReleaseReservation(ctx, run.ID, req.Owner, run.LeaseToken)
 			return deliveries, startErr
 		}
-		deliveries = append(deliveries, Delivery{Message: Message{RunID: run.ID, ProjectID: run.ProjectID, QueueID: run.QueueID, Priority: run.Priority, Payload: run.Payload}, Execution: execution, Owner: req.Owner})
+		deliveries = append(deliveries, Delivery{Message: Message{DispatchID: run.DispatchID, RunID: run.ID, ProjectID: run.ProjectID, QueueID: run.QueueID, Priority: run.Priority}, Execution: execution, Owner: req.Owner})
 	}
 	return deliveries, nil
 }
