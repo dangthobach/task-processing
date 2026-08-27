@@ -42,6 +42,7 @@ The exact backend-to-React endpoint mapping is in [docs/API_FE_MAPPING.md](docs/
 The portable queue semantics and PostgreSQL adapter are in [docs/QUEUE_BACKENDS.md](docs/QUEUE_BACKENDS.md).
 The high-throughput handler middleware contract and tuning guidance are in [docs/MIDDLEWARE_RUNTIME.md](docs/MIDDLEWARE_RUNTIME.md).
 The Vietnamese operator walkthrough, UI enum reference and BRD follow-up backlog are in [docs/USER_OPERATIONS_GUIDE.vi.md](docs/USER_OPERATIONS_GUIDE.vi.md).
+Developer entrypoints, runtime flow and feature implementation workflow are in [docs/DEVELOPER_IMPLEMENTATION_GUIDE.vi.md](docs/DEVELOPER_IMPLEMENTATION_GUIDE.vi.md).
 
 The API listens on `:8080`; open `http://localhost:8080/` for the small operational dashboard. Development identity headers are required for protected routes:
 
