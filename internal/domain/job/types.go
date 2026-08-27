@@ -81,6 +81,8 @@ type Run struct {
 	AttemptNumber   int             `json:"attempt_number,omitempty"`
 	LeaseToken      uuid.UUID       `json:"-"`
 	DispatchID      uuid.UUID       `json:"-"`
+	TraceParent     string          `json:"-"`
+	TraceState      string          `json:"-"`
 }
 type Execution struct {
 	RunID           uuid.UUID
@@ -97,6 +99,8 @@ type Execution struct {
 	Payload         json.RawMessage
 	Policy          PolicySnapshot
 	Attempt         int
+	TraceParent     string
+	TraceState      string
 }
 
 // ExecutionContext is the typed, per-attempt context supplied to every handler.
@@ -144,10 +148,15 @@ type BatchItem struct {
 type BatchExecution struct {
 	BatchID, AttemptID               uuid.UUID
 	ProjectID, QueueID, DefinitionID uuid.UUID
-	FunctionKey                      string
+	FunctionKey, FunctionVersion     string
 	Policy                           PolicySnapshot
 	Items                            []BatchItem
 	Attempt                          int
+	// LeaseToken fences every mutable batch operation. It is intentionally not
+	// serialized to handlers; typed contexts carry it only back to the worker
+	// persistence boundary for progress and terminal transitions.
+	LeaseToken     uuid.UUID
+	LeaseExpiresAt time.Time
 }
 type BatchItemResult struct {
 	ItemID  uuid.UUID
@@ -192,15 +201,58 @@ type ClassifiedError struct {
 
 func (e *ClassifiedError) Error() string { return e.Err.Error() }
 func (e *ClassifiedError) Unwrap() error { return e.Err }
+
+// ErrorClassifier translates an application error into a stable platform
+// classification. It must be pure, non-blocking and must not perform I/O: the
+// worker invokes it on the completion path of every attempt.
+type ErrorClassifier interface {
+	Classify(error) *ClassifiedError
+}
+
+type ErrorClassifierFunc func(error) *ClassifiedError
+
+func (f ErrorClassifierFunc) Classify(err error) *ClassifiedError { return f(err) }
+
 func Classify(err error) *ClassifiedError {
+	return ClassifyWith(err)
+}
+
+// ClassifyWith keeps an explicit ClassifiedError authoritative, then evaluates
+// custom classifiers in order. A faulty extension cannot crash the worker or
+// suppress the original failure; it falls through to the conservative default.
+func ClassifyWith(err error, classifiers ...ErrorClassifier) (result *ClassifiedError) {
 	var c *ClassifiedError
 	if errors.As(err, &c) {
 		return c
 	}
+	for _, classifier := range classifiers {
+		if classifier == nil {
+			continue
+		}
+		candidate := safelyClassify(classifier, err)
+		if candidate != nil && candidate.Class != "" {
+			if candidate.Err == nil {
+				candidate.Err = err
+			}
+			return candidate
+		}
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &ClassifiedError{Class: Timeout, Code: "DEADLINE_EXCEEDED", Err: err}
 	}
+	if errors.Is(err, context.Canceled) {
+		return &ClassifiedError{Class: CancelledError, Code: "CONTEXT_CANCELLED", Err: err}
+	}
 	return &ClassifiedError{Class: Transient, Code: "UNCLASSIFIED", Err: err}
+}
+
+func safelyClassify(classifier ErrorClassifier, err error) (result *ClassifiedError) {
+	defer func() {
+		if recover() != nil {
+			result = nil
+		}
+	}()
+	return classifier.Classify(err)
 }
 func Retryable(class ErrorClass, p RetryPolicy) bool {
 	switch class {

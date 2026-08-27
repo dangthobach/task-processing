@@ -62,11 +62,13 @@ func main() {
 		panic(err)
 	}
 	reg := registry.New()
-	reg.Register("example.echo", func(e *job.ExecutionContext) error {
+	if err := reg.RegisterVersion("example.echo", "v1", func(e *job.ExecutionContext) error {
 		slog.Info("echo handled", "run_id", e.Execution.RunID, "payload", string(e.Execution.Payload))
 		return nil
-	})
-	reg.RegisterBatch("example.batch_echo", func(ctx *job.BatchExecutionContext) ([]job.BatchItemResult, error) {
+	}); err != nil {
+		panic(err)
+	}
+	if err := reg.RegisterBatchVersion("example.batch_echo", "v1", func(ctx *job.BatchExecutionContext) ([]job.BatchItemResult, error) {
 		results := make([]job.BatchItemResult, 0, len(ctx.Batch.Items))
 		for index, item := range ctx.Batch.Items {
 			_ = ctx.Log("INFO", "batch item processed", map[string]any{"ordinal": item.Ordinal, "job_run_id": item.Run.RunID})
@@ -74,14 +76,16 @@ func main() {
 			_ = ctx.ReportProgress(index+1, "items processed")
 		}
 		return results, nil
-	})
+	}); err != nil {
+		panic(err)
+	}
 	id := uuid.New()
 	var workerID uuid.UUID
 	err = store.Pool.QueryRow(ctx, `INSERT INTO workers(worker_key,hostname,version) VALUES($1,$2,'dev') ON CONFLICT(worker_key) DO UPDATE SET heartbeat_at=now(),status='ONLINE' RETURNING id`, id.String(), "local").Scan(&workerID)
 	if err != nil {
 		panic(err)
 	}
-	w := &worker.Worker{Store: store, Registry: reg, ID: workerID, Owner: id.String(), Config: config, Backends: backends, AuditSink: auditSink, Log: slog.Default()}
+	w := &worker.Worker{Store: store, Registry: reg, ID: workerID, Owner: id.String(), Config: config, Middleware: config.MiddlewareStack(), Backends: backends, AuditSink: auditSink, Log: slog.Default()}
 	if err = w.Run(ctx); err != nil && ctx.Err() == nil {
 		panic(err)
 	}

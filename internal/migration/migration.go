@@ -31,6 +31,7 @@ type Migration struct {
 type Result struct {
 	Applied   []int64
 	Baselined []int64
+	Repaired  []int64
 	Skipped   []int64
 }
 
@@ -39,6 +40,11 @@ type Options struct {
 	// only when an untracked database already contains the task-processing
 	// schema. Zero requires the operator to make the baseline decision.
 	BaselineThrough int64
+	// RepairLedgerThrough records missing migration ledger entries only after
+	// the existing schema has passed the same structural verifier used for an
+	// initial baseline. It is for a partially populated ledger caused by manual
+	// SQL execution; it never executes or skips unverifiable migration SQL.
+	RepairLedgerThrough int64
 }
 
 // Load parses numbered SQL files from fsys and verifies that their migration
@@ -140,6 +146,15 @@ func Run(ctx context.Context, pool *pgxpool.Pool, migrations []Migration, opts O
 		return Result{}, fmt.Errorf("inspect existing schema: %w", err)
 	}
 	result := Result{}
+	if opts.RepairLedgerThrough < 0 {
+		return Result{}, fmt.Errorf("unsafe ledger repair version %d", opts.RepairLedgerThrough)
+	}
+	if opts.RepairLedgerThrough > migrations[len(migrations)-1].Version {
+		return Result{}, fmt.Errorf("ledger repair version %d exceeds latest known migration %d", opts.RepairLedgerThrough, migrations[len(migrations)-1].Version)
+	}
+	if opts.BaselineThrough > 0 && opts.RepairLedgerThrough > 0 {
+		return Result{}, errors.New("baseline and ledger repair cannot be requested together")
+	}
 	if len(applied) == 0 && hasSchema {
 		if opts.BaselineThrough <= 0 {
 			return Result{}, errors.New("existing task-processing schema has no migration ledger; set MIGRATION_BASELINE_THROUGH after verifying its applied version")
@@ -156,6 +171,27 @@ func Run(ctx context.Context, pool *pgxpool.Pool, migrations []Migration, opts O
 			}
 			applied[m.Version] = m.Checksum
 			result.Baselined = append(result.Baselined, m.Version)
+		}
+	}
+	if opts.RepairLedgerThrough > 0 {
+		if !hasSchema {
+			return Result{}, errors.New("cannot repair a migration ledger without an existing task-processing schema")
+		}
+		if err = VerifyBaseline(ctx, conn, opts.RepairLedgerThrough); err != nil {
+			return Result{}, fmt.Errorf("verify migration ledger repair: %w", err)
+		}
+		for _, m := range migrations {
+			if m.Version > opts.RepairLedgerThrough {
+				continue
+			}
+			if _, exists := applied[m.Version]; exists {
+				continue
+			}
+			if _, err = conn.Exec(ctx, "INSERT INTO schema_migrations(version,filename,checksum) VALUES($1,$2,$3)", m.Version, m.Filename, m.Checksum); err != nil {
+				return Result{}, fmt.Errorf("repair migration ledger for %s: %w", m.Filename, err)
+			}
+			applied[m.Version] = m.Checksum
+			result.Repaired = append(result.Repaired, m.Version)
 		}
 	}
 

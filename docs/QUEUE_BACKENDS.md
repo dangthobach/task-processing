@@ -33,3 +33,20 @@ TASK_NATS_CONSUMER=task-workers                # optional
 
 `BATCH` execution remains PostgreSQL-only. Configure a batch definition on a
 queue without an external backend until a batch transport protocol is added.
+
+## Batch lease safety
+
+PostgreSQL batches have a fenced `lease_token`, shared by the batch and its
+member runs. Progress, structured batch logs, lease renewal and completion all
+require the live token. Lease recovery clears it before it requeues items, so a
+late handler cannot overwrite recovered work. Workers cancel the typed batch
+handler with `ErrLeaseLost` when renewal can no longer complete before the
+lease deadline.
+
+## Publication failure expiry
+
+Queue publication uses a fenced outbox lease and exponential backoff. After 20
+failed publications the intent is marked expired and only the still-current
+`ENQUEUE_PENDING` generation is moved to DLQ with reason
+`OUTBOX_DELIVERY_EXPIRED`; a stale callback can never overwrite a newer
+dispatch or cancellation.

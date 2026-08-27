@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/example/task-processing/internal/domain/job"
 	"github.com/example/task-processing/internal/persistence/postgres"
@@ -12,9 +13,10 @@ import (
 )
 
 type fakeRepo struct {
-	queued    bool
-	state     string
-	submitted []postgres.Submit
+	queued          bool
+	state           string
+	submitted       []postgres.Submit
+	createdSchedule postgres.CreateSchedule
 }
 
 func (f *fakeRepo) Submit(_ context.Context, in postgres.Submit) (job.Run, error) {
@@ -38,7 +40,8 @@ func (f *fakeRepo) TransitionQueue(_ context.Context, _, _ uuid.UUID, to string,
 	f.state = to
 	return f.queued, nil
 }
-func (f *fakeRepo) CreateSchedule(context.Context, postgres.CreateSchedule) (uuid.UUID, error) {
+func (f *fakeRepo) CreateSchedule(_ context.Context, in postgres.CreateSchedule) (uuid.UUID, error) {
+	f.createdSchedule = in
 	return uuid.New(), nil
 }
 func (f *fakeRepo) TransitionSchedule(context.Context, uuid.UUID, uuid.UUID, string, int64) (bool, error) {
@@ -86,5 +89,25 @@ func TestScheduleValidatesCronAndTimezone(t *testing.T) {
 	_, err = New(repo).Schedules.Create(context.Background(), ScheduleInput{ProjectID: uuid.New(), DefinitionID: uuid.New(), Cron: "* * * * *", Timezone: "Mars/Olympus"})
 	if !errors.Is(err, ErrInvalidInput) {
 		t.Fatalf("tz err=%v", err)
+	}
+}
+
+func TestScheduleCreatesCanonicalOneTime(t *testing.T) {
+	repo := &fakeRepo{}
+	runAt := time.Now().Add(time.Minute).In(time.FixedZone("UTC+7", 7*60*60))
+	_, err := New(repo).Schedules.Create(context.Background(), ScheduleInput{ProjectID: uuid.New(), DefinitionID: uuid.New(), Type: "ONE_TIME", RunAt: &runAt})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repo.createdSchedule.Type != "ONE_TIME" || repo.createdSchedule.RunAt == nil || repo.createdSchedule.RunAt.Location() != time.UTC || repo.createdSchedule.MisfirePolicy != "FIRE_ONCE" {
+		t.Fatalf("schedule=%+v", repo.createdSchedule)
+	}
+}
+
+func TestScheduleRejectsPastOneTime(t *testing.T) {
+	past := time.Now().Add(-time.Second)
+	_, err := New(&fakeRepo{}).Schedules.Create(context.Background(), ScheduleInput{ProjectID: uuid.New(), DefinitionID: uuid.New(), Type: "ONE_TIME", RunAt: &past})
+	if !errors.Is(err, ErrInvalidInput) {
+		t.Fatalf("err=%v", err)
 	}
 }

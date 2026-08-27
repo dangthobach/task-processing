@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"errors"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -26,13 +27,17 @@ func (s *Store) TransitionQueue(ctx context.Context, project, id uuid.UUID, to s
 
 type CreateSchedule struct {
 	ProjectID, DefinitionID uuid.UUID
-	Cron, Timezone          string
+	Type, Cron, Timezone    string
+	MisfirePolicy           string
 	WithSeconds             bool
+	RunAt                   *time.Time
 }
 
 func (s *Store) CreateSchedule(ctx context.Context, in CreateSchedule) (uuid.UUID, error) {
 	var id uuid.UUID
-	err := s.Pool.QueryRow(ctx, `INSERT INTO schedules(job_definition_id,schedule_type,cron_expression,timezone,with_seconds) SELECT id,'CRON',$1,$2,$3 FROM job_definitions WHERE id=$4 AND project_id=$5 AND deleted_at IS NULL RETURNING id`, in.Cron, in.Timezone, in.WithSeconds, in.DefinitionID, in.ProjectID).Scan(&id)
+	err := s.Pool.QueryRow(ctx, `INSERT INTO schedules(job_definition_id,schedule_type,cron_expression,timezone,with_seconds,run_at,misfire_policy)
+		SELECT id,$1,NULLIF($2,''),$3,$4,$5,$6 FROM job_definitions
+		WHERE id=$7 AND project_id=$8 AND deleted_at IS NULL RETURNING id`, in.Type, in.Cron, in.Timezone, in.WithSeconds, in.RunAt, in.MisfirePolicy, in.DefinitionID, in.ProjectID).Scan(&id)
 	return id, err
 }
 func (s *Store) TransitionSchedule(ctx context.Context, project, id uuid.UUID, to string, version int64) (bool, error) {

@@ -156,33 +156,73 @@ func (s Queues) transition(ctx context.Context, p, q uuid.UUID, to string, from 
 
 type ScheduleInput struct {
 	ProjectID, DefinitionID uuid.UUID
-	Cron, Timezone          string
+	Type, Cron, Timezone    string
+	MisfirePolicy           string
 	WithSeconds             bool
+	RunAt                   *time.Time
 }
 type Schedules struct{ repo Repository }
 
 func (s Schedules) Create(ctx context.Context, in ScheduleInput) (uuid.UUID, error) {
-	if in.ProjectID == uuid.Nil || in.DefinitionID == uuid.Nil || in.Cron == "" {
-		return uuid.Nil, fmt.Errorf("%w: project_id, job_definition_id and cron_expression are required", ErrInvalidInput)
+	if in.ProjectID == uuid.Nil || in.DefinitionID == uuid.Nil {
+		return uuid.Nil, fmt.Errorf("%w: project_id and job_definition_id are required", ErrInvalidInput)
 	}
+	in.Type = strings.ToUpper(strings.TrimSpace(in.Type))
+	if in.Type == "" {
+		in.Type = "CRON"
+	}
+	in.MisfirePolicy = strings.ToUpper(strings.TrimSpace(in.MisfirePolicy))
 	if in.Timezone == "" {
 		in.Timezone = "UTC"
 	}
-	upperCron := strings.ToUpper(strings.TrimSpace(in.Cron))
-	if strings.HasPrefix(upperCron, "TZ=") || strings.HasPrefix(upperCron, "CRON_TZ=") {
-		return uuid.Nil, fmt.Errorf("%w: cron expression must not include a timezone prefix", ErrInvalidInput)
+	switch in.Type {
+	case "CRON":
+		if in.Cron == "" {
+			return uuid.Nil, fmt.Errorf("%w: cron_expression is required for CRON", ErrInvalidInput)
+		}
+		if in.RunAt != nil {
+			return uuid.Nil, fmt.Errorf("%w: run_at is only valid for ONE_TIME", ErrInvalidInput)
+		}
+		upperCron := strings.ToUpper(strings.TrimSpace(in.Cron))
+		if strings.HasPrefix(upperCron, "TZ=") || strings.HasPrefix(upperCron, "CRON_TZ=") {
+			return uuid.Nil, fmt.Errorf("%w: cron expression must not include a timezone prefix", ErrInvalidInput)
+		}
+		if _, err := time.LoadLocation(in.Timezone); err != nil {
+			return uuid.Nil, fmt.Errorf("%w: timezone: %v", ErrInvalidInput, err)
+		}
+		parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+		if in.WithSeconds {
+			parser = cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+		}
+		if _, err := parser.Parse(in.Cron); err != nil {
+			return uuid.Nil, fmt.Errorf("%w: cron expression: %v", ErrInvalidInput, err)
+		}
+		if in.MisfirePolicy == "" {
+			in.MisfirePolicy = "FIRE_ONCE"
+		}
+	case "ONE_TIME":
+		if in.Cron != "" || in.WithSeconds {
+			return uuid.Nil, fmt.Errorf("%w: cron_expression and with_seconds are not valid for ONE_TIME", ErrInvalidInput)
+		}
+		if in.RunAt == nil || !in.RunAt.UTC().After(time.Now().UTC()) {
+			return uuid.Nil, fmt.Errorf("%w: run_at must be a future RFC3339 timestamp", ErrInvalidInput)
+		}
+		runAt := in.RunAt.UTC()
+		in.RunAt = &runAt
+		in.Timezone = "UTC"
+		if in.MisfirePolicy == "" {
+			in.MisfirePolicy = "FIRE_ONCE"
+		}
+		if in.MisfirePolicy != "FIRE_ONCE" {
+			return uuid.Nil, fmt.Errorf("%w: ONE_TIME requires FIRE_ONCE to guarantee a durable occurrence", ErrInvalidInput)
+		}
+	default:
+		return uuid.Nil, fmt.Errorf("%w: schedule_type must be CRON or ONE_TIME", ErrInvalidInput)
 	}
-	if _, err := time.LoadLocation(in.Timezone); err != nil {
-		return uuid.Nil, fmt.Errorf("%w: timezone: %v", ErrInvalidInput, err)
+	if in.MisfirePolicy != "SKIP" && in.MisfirePolicy != "FIRE_ONCE" {
+		return uuid.Nil, fmt.Errorf("%w: misfire_policy must be SKIP or FIRE_ONCE", ErrInvalidInput)
 	}
-	parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	if in.WithSeconds {
-		parser = cron.NewParser(cron.Second | cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-	}
-	if _, err := parser.Parse(in.Cron); err != nil {
-		return uuid.Nil, fmt.Errorf("%w: cron expression: %v", ErrInvalidInput, err)
-	}
-	return s.repo.CreateSchedule(ctx, postgres.CreateSchedule{ProjectID: in.ProjectID, DefinitionID: in.DefinitionID, Cron: in.Cron, Timezone: in.Timezone, WithSeconds: in.WithSeconds})
+	return s.repo.CreateSchedule(ctx, postgres.CreateSchedule{ProjectID: in.ProjectID, DefinitionID: in.DefinitionID, Type: in.Type, Cron: in.Cron, Timezone: in.Timezone, WithSeconds: in.WithSeconds, RunAt: in.RunAt, MisfirePolicy: in.MisfirePolicy})
 }
 func (s Schedules) Pause(ctx context.Context, p, id uuid.UUID, version int64) error {
 	return s.state(ctx, p, id, "PAUSED", version)

@@ -9,12 +9,15 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"go.opentelemetry.io/otel/trace"
+	"strings"
 	"time"
 )
 
 var ErrConcurrencyLimited = errors.New("execution concurrency limit reached")
 var ErrRateLimited = errors.New("rate limit reached")
 var ErrDispatchLost = errors.New("dispatch is stale or no longer claimable")
+
+const maxQueueOutboxAttempts = 20
 
 type QueueDepthStats struct {
 	Queued  int64
@@ -79,11 +82,11 @@ func (s *Store) ClaimOutbox(ctx context.Context, owner string, limit int, lease 
 	}
 	rows, err := s.Pool.Query(ctx, `WITH picked AS (
 		SELECT id FROM outbox_events
-		WHERE event_type='job.enqueue' AND published_at IS NULL AND available_at<=now()
+		WHERE event_type='job.enqueue' AND published_at IS NULL AND expired_at IS NULL AND available_at<=now()
 		  AND (claim_expires_at IS NULL OR claim_expires_at<=now())
 		ORDER BY available_at,id FOR UPDATE SKIP LOCKED LIMIT $3
 	) UPDATE outbox_events o
-	SET claimed_by=$1,claim_token=gen_random_uuid(),claim_expires_at=now()+($2 * interval '1 millisecond')
+	SET claimed_by=$1,claim_token=gen_random_uuid(),claim_expires_at=now()+($2::bigint * interval '1 millisecond')
 	FROM picked p, job_runs r JOIN queues q ON q.id=r.queue_id LEFT JOIN queue_backends b ON b.id=q.backend_id
 	WHERE o.id=p.id AND r.id=o.aggregate_id AND o.dispatch_id=r.current_dispatch_id
 	RETURNING o.id,o.claim_token,o.dispatch_id,COALESCE(b.backend_type,'POSTGRES'),b.id,r.id,r.project_id,r.queue_id,r.priority,r.available_at`, owner, lease.Milliseconds(), limit)
@@ -102,7 +105,7 @@ func (s *Store) ClaimOutbox(ctx context.Context, owner string, limit int, lease 
 	return items, rows.Err()
 }
 func (s *Store) MarkOutboxPublished(ctx context.Context, id, token uuid.UUID) error {
-	tag, err := s.Pool.Exec(ctx, "UPDATE outbox_events SET published_at=now(),attempts=attempts+1,last_error=NULL,claimed_by=NULL,claim_token=NULL,claim_expires_at=NULL WHERE id=$1 AND claim_token=$2 AND claim_expires_at>now() AND published_at IS NULL", id, token)
+	tag, err := s.Pool.Exec(ctx, "UPDATE outbox_events SET published_at=now(),attempts=attempts+1,last_error=NULL,claimed_by=NULL,claim_token=NULL,claim_expires_at=NULL WHERE id=$1 AND claim_token=$2 AND claim_expires_at>now() AND published_at IS NULL AND expired_at IS NULL", id, token)
 	if err != nil {
 		return err
 	}
@@ -112,14 +115,53 @@ func (s *Store) MarkOutboxPublished(ctx context.Context, id, token uuid.UUID) er
 	return nil
 }
 func (s *Store) RecordOutboxFailure(ctx context.Context, id, token uuid.UUID, cause error) error {
-	tag, err := s.Pool.Exec(ctx, "UPDATE outbox_events SET attempts=attempts+1,last_error=$3,available_at=now()+(LEAST(attempts+1,8) * interval '1 second'),claimed_by=NULL,claim_token=NULL,claim_expires_at=NULL WHERE id=$1 AND claim_token=$2 AND claim_expires_at>now() AND published_at IS NULL", id, token, truncate(cause.Error(), 1000))
+	if cause == nil {
+		cause = errors.New("outbox publication failed without a cause")
+	}
+	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
-	if tag.RowsAffected() != 1 {
-		return errors.New("outbox claim lost before failure acknowledgement")
+	defer tx.Rollback(ctx)
+	if err = setSystemAuditContext(ctx, tx); err != nil {
+		return err
 	}
-	return nil
+	var aggregate, dispatch uuid.UUID
+	var eventType string
+	var expired bool
+	var attempts int
+	err = tx.QueryRow(ctx, `UPDATE outbox_events
+		SET attempts=attempts+1,last_error=$3,
+			available_at=now()+(LEAST(attempts+1,8) * interval '1 second'),
+			expired_at=CASE WHEN attempts+1 >= $4 THEN now() ELSE NULL END,
+			claimed_by=NULL,claim_token=NULL,claim_expires_at=NULL
+		WHERE id=$1 AND claim_token=$2 AND claim_expires_at>now() AND published_at IS NULL AND expired_at IS NULL
+		RETURNING aggregate_id,dispatch_id,event_type,expired_at IS NOT NULL,attempts`, id, token, truncate(cause.Error(), 1000), maxQueueOutboxAttempts).Scan(&aggregate, &dispatch, &eventType, &expired, &attempts)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return errors.New("outbox claim lost before failure acknowledgement")
+		}
+		return err
+	}
+	if !expired || eventType != "job.enqueue" {
+		return tx.Commit(ctx)
+	}
+	tag, err := tx.Exec(ctx, "UPDATE job_runs SET status='DEAD_LETTER',finished_at=now(),lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=now() WHERE id=$1 AND current_dispatch_id=$2 AND status='ENQUEUE_PENDING'", aggregate, dispatch)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() == 0 {
+		// A cancellation or newer generation won the race; the expired outbox is
+		// still terminal, but it must not overwrite that newer run state.
+		return tx.Commit(ctx)
+	}
+	if _, err = tx.Exec(ctx, "INSERT INTO dlq_entries(job_run_id,reason) VALUES($1,'OUTBOX_DELIVERY_EXPIRED') ON CONFLICT(job_run_id) DO NOTHING", aggregate); err != nil {
+		return err
+	}
+	if _, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) SELECT project_id,'job.outbox_expired','job_run',id,jsonb_build_object('outbox_id',$2::uuid,'attempts',$3::integer,'reason',$4::text) FROM job_runs WHERE id=$1", aggregate, id, attempts, truncate(cause.Error(), 1000)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // DispatchRef identifies one immutable attempt to dispatch a job run. A stale
@@ -186,7 +228,7 @@ func (s *Store) TakeDispatchOwnership(ctx context.Context, runID, dispatchID uui
 		lease = time.Minute
 	}
 	var claim DispatchOwnership
-	err := s.Pool.QueryRow(ctx, `UPDATE job_runs r SET status='RESERVED',lease_owner=$3,lease_token=gen_random_uuid(),lease_expires_at=now()+($4 * interval '1 millisecond'),reserved_at=now(),updated_at=now()
+	err := s.Pool.QueryRow(ctx, `UPDATE job_runs r SET status='RESERVED',lease_owner=$3,lease_token=gen_random_uuid(),lease_expires_at=now()+($4::bigint * interval '1 millisecond'),reserved_at=now(),updated_at=now()
 		FROM queues q, job_definitions jd
 		WHERE r.id=$1 AND r.current_dispatch_id=$2 AND r.status='QUEUED' AND r.available_at<=now()
 		  AND q.id=r.queue_id AND jd.id=r.job_definition_id AND q.status='ACTIVE' AND q.deleted_at IS NULL AND jd.deleted_at IS NULL AND jd.execution_mode='SINGLE'
@@ -267,7 +309,7 @@ var ErrLeaseLost = errors.New("job lease lost")
 
 func (s *Store) ExtendLease(ctx context.Context, runID uuid.UUID, owner string, token uuid.UUID, lease time.Duration) (time.Time, error) {
 	var expiresAt time.Time
-	err := s.Pool.QueryRow(ctx, "UPDATE job_runs SET lease_expires_at=now()+($4 * interval '1 millisecond'),updated_at=now() WHERE id=$1 AND status='RUNNING' AND lease_owner=$2 AND lease_token=$3 AND lease_expires_at>now() RETURNING lease_expires_at", runID, owner, token, lease.Milliseconds()).Scan(&expiresAt)
+	err := s.Pool.QueryRow(ctx, "UPDATE job_runs SET lease_expires_at=now()+($4::bigint * interval '1 millisecond'),updated_at=now() WHERE id=$1 AND status='RUNNING' AND lease_owner=$2 AND lease_token=$3 AND lease_expires_at>now() RETURNING lease_expires_at", runID, owner, token, lease.Milliseconds()).Scan(&expiresAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, ErrLeaseLost
 	}
@@ -283,7 +325,7 @@ func (s *Store) Claim(ctx context.Context, workerID uuid.UUID, owner string, lim
 		return nil, err
 	}
 	defer tx.Rollback(ctx)
-	rows, err := tx.Query(ctx, `WITH picked AS (SELECT r.id FROM job_runs r JOIN queues q ON q.id=r.queue_id LEFT JOIN queue_backends qb ON qb.id=q.backend_id JOIN job_definitions jd ON jd.id=r.job_definition_id WHERE r.status='QUEUED' AND r.available_at<=now() AND q.status='ACTIVE' AND q.deleted_at IS NULL AND jd.deleted_at IS NULL AND jd.execution_mode='SINGLE' AND (q.backend_id IS NULL OR (qb.backend_type='POSTGRES' AND qb.status='ACTIVE' AND qb.deleted_at IS NULL)) ORDER BY r.priority DESC,r.available_at ASC,r.id ASC FOR UPDATE OF r SKIP LOCKED LIMIT $1) UPDATE job_runs r SET status='RESERVED',lease_owner=$2,lease_token=gen_random_uuid(),lease_expires_at=now()+($3 * interval '1 millisecond'),reserved_at=now(),updated_at=now() FROM picked WHERE r.id=picked.id RETURNING r.id,r.project_id,r.job_definition_id,r.queue_id,r.idempotency_key,r.priority,r.payload,r.function_version,r.policy_snapshot,r.lease_token,r.current_dispatch_id`, limit, owner, lease.Milliseconds())
+	rows, err := tx.Query(ctx, `WITH picked AS (SELECT r.id FROM job_runs r JOIN queues q ON q.id=r.queue_id LEFT JOIN queue_backends qb ON qb.id=q.backend_id JOIN job_definitions jd ON jd.id=r.job_definition_id WHERE r.status='QUEUED' AND r.available_at<=now() AND q.status='ACTIVE' AND q.deleted_at IS NULL AND jd.deleted_at IS NULL AND jd.execution_mode='SINGLE' AND (q.backend_id IS NULL OR (qb.backend_type='POSTGRES' AND qb.status='ACTIVE' AND qb.deleted_at IS NULL)) ORDER BY r.priority DESC,r.available_at ASC,r.id ASC FOR UPDATE OF r SKIP LOCKED LIMIT $1) UPDATE job_runs r SET status='RESERVED',lease_owner=$2,lease_token=gen_random_uuid(),lease_expires_at=now()+($3::bigint * interval '1 millisecond'),reserved_at=now(),updated_at=now() FROM picked WHERE r.id=picked.id RETURNING r.id,r.project_id,r.job_definition_id,r.queue_id,COALESCE(r.idempotency_key,''),r.priority,r.payload,r.function_version,r.policy_snapshot,r.lease_token,r.current_dispatch_id`, limit, owner, lease.Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -329,7 +371,7 @@ func (s *Store) StartAttempt(ctx context.Context, runID, workerID uuid.UUID, own
 		if errors.Is(err, pgx.ErrNoRows) {
 			return job.Execution{}, ErrLeaseLost
 		}
-		return job.Execution{}, err
+		return job.Execution{}, fmt.Errorf("load attempt admission state: %w", err)
 	}
 	if allowed, rateErr := s.takeRateLimits(ctx, tx, r.ProjectID, r.QueueID, r.DefinitionID, "WORKER_START"); rateErr != nil {
 		return job.Execution{}, rateErr
@@ -369,12 +411,12 @@ func (s *Store) StartAttempt(ctx context.Context, runID, workerID uuid.UUID, own
 	var policy, ciphertext []byte
 	var keyRef string
 	var leaseExpiresAt time.Time
-	err = tx.QueryRow(ctx, `UPDATE job_runs r SET status='RUNNING',started_at=COALESCE(started_at,now()),lease_expires_at=now()+($4 * interval '1 millisecond'),updated_at=now() FROM job_definitions jd JOIN function_definitions fd ON fd.id=jd.function_id WHERE r.id=$1 AND r.job_definition_id=jd.id AND r.status='RESERVED' AND r.lease_owner=$2 AND r.lease_token=$3 AND r.lease_expires_at>now() AND jd.deleted_at IS NULL AND fd.deleted_at IS NULL RETURNING r.id,r.function_version,fd.function_key,r.idempotency_key,r.payload,r.payload_ciphertext,COALESCE(r.encryption_key_ref,''),r.policy_snapshot,r.lease_expires_at`, runID, owner, token, lease.Milliseconds()).Scan(&r.ID, &r.FunctionVersion, &r.FunctionKey, &r.IdempotencyKey, &r.Payload, &ciphertext, &keyRef, &policy, &leaseExpiresAt)
+	err = tx.QueryRow(ctx, `UPDATE job_runs r SET status='RUNNING',started_at=COALESCE(started_at,now()),lease_expires_at=now()+($4::bigint * interval '1 millisecond'),updated_at=now() FROM job_definitions jd JOIN function_definitions fd ON fd.id=jd.function_id WHERE r.id=$1 AND r.job_definition_id=jd.id AND r.status='RESERVED' AND r.lease_owner=$2 AND r.lease_token=$3 AND r.lease_expires_at>now() AND jd.deleted_at IS NULL AND fd.deleted_at IS NULL RETURNING r.id,r.function_version,fd.function_key,COALESCE(r.idempotency_key,''),r.payload,r.payload_ciphertext,COALESCE(r.encryption_key_ref,''),r.policy_snapshot,r.lease_expires_at,COALESCE(r.traceparent,''),COALESCE(r.tracestate,'')`, runID, owner, token, lease.Milliseconds()).Scan(&r.ID, &r.FunctionVersion, &r.FunctionKey, &r.IdempotencyKey, &r.Payload, &ciphertext, &keyRef, &policy, &leaseExpiresAt, &r.TraceParent, &r.TraceState)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return job.Execution{}, ErrLeaseLost
 		}
-		return job.Execution{}, err
+		return job.Execution{}, fmt.Errorf("transition reserved run to running: %w", err)
 	}
 	if err = json.Unmarshal(policy, &r.Policy); err != nil {
 		return job.Execution{}, err
@@ -384,25 +426,30 @@ func (s *Store) StartAttempt(ctx context.Context, runID, workerID uuid.UUID, own
 	}
 	var n int
 	if err = tx.QueryRow(ctx, "SELECT COALESCE(MAX(attempt_number),0)+1 FROM job_attempts WHERE job_run_id=$1", runID).Scan(&n); err != nil {
-		return job.Execution{}, err
+		return job.Execution{}, fmt.Errorf("allocate attempt number: %w", err)
 	}
 	attemptID := uuid.New()
 	traceID := ""
 	if span := trace.SpanContextFromContext(ctx); span.IsValid() {
 		traceID = span.TraceID().String()
 	}
+	if parts := strings.Split(r.TraceParent, "-"); len(parts) == 4 && len(parts[1]) == 32 {
+		// The header has already been W3C-validated on submission. The worker
+		// creates its child span immediately after this transaction commits.
+		traceID = parts[1]
+	}
 	_, err = tx.Exec(ctx, "INSERT INTO job_attempts(id,job_run_id,worker_id,attempt_number,status,trace_id) VALUES($1,$2,$3,$4,'RUNNING',NULLIF($5,''))", attemptID, runID, workerID, n, traceID)
 	if err != nil {
-		return job.Execution{}, err
+		return job.Execution{}, fmt.Errorf("insert job attempt: %w", err)
 	}
 	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,'job.started','job_run',$2,jsonb_build_object('attempt_id',$3::uuid,'attempt_number',$4::integer))", r.ProjectID, runID, attemptID, n)
 	if err != nil {
-		return job.Execution{}, err
+		return job.Execution{}, fmt.Errorf("write job started event: %w", err)
 	}
 	if err = tx.Commit(ctx); err != nil {
 		return job.Execution{}, err
 	}
-	return job.Execution{RunID: runID, AttemptID: attemptID, TenantID: tenantID, ProjectID: r.ProjectID, QueueID: r.QueueID, DefinitionID: r.DefinitionID, FunctionKey: r.FunctionKey, FunctionVersion: r.FunctionVersion, IdempotencyKey: r.IdempotencyKey, Payload: r.Payload, Policy: r.Policy, Attempt: n, LeaseToken: token, LeaseExpiresAt: leaseExpiresAt}, nil
+	return job.Execution{RunID: runID, AttemptID: attemptID, TenantID: tenantID, ProjectID: r.ProjectID, QueueID: r.QueueID, DefinitionID: r.DefinitionID, FunctionKey: r.FunctionKey, FunctionVersion: r.FunctionVersion, IdempotencyKey: r.IdempotencyKey, Payload: r.Payload, Policy: r.Policy, Attempt: n, LeaseToken: token, LeaseExpiresAt: leaseExpiresAt, TraceParent: r.TraceParent, TraceState: r.TraceState}, nil
 }
 
 func (s *Store) takeRateLimits(ctx context.Context, tx pgx.Tx, project, queue, definition uuid.UUID, point string) (bool, error) {
@@ -528,7 +575,10 @@ func (s *Store) CompleteFailure(ctx context.Context, ex job.Execution, owner str
 	if !retry {
 		eventType = "job.dlq"
 	}
-	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,$2,'job_run',$3,jsonb_build_object('attempt_id',$4,'error_class',$5,'available_at',$6))", ex.ProjectID, eventType, ex.RunID, ex.AttemptID, class.Class, available)
+	// jsonb_build_object is polymorphic; PostgreSQL cannot infer parameter types
+	// passed only through its any-compatible value arguments. Keep casts here so
+	// retry/DLQ persistence does not fail after the run transition has started.
+	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,$2,'job_run',$3,jsonb_build_object('attempt_id',$4::uuid,'error_class',$5::text,'available_at',$6::timestamptz))", ex.ProjectID, eventType, ex.RunID, ex.AttemptID, class.Class, available)
 	if err != nil {
 		return err
 	}
@@ -552,7 +602,7 @@ func (s *Store) ReportProgress(ctx context.Context, ex *job.Execution, owner str
 	if tag.RowsAffected() != 1 {
 		return ErrLeaseLost
 	}
-	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,'job.progress','job_run',$2,jsonb_build_object('attempt_id',$3,'percent',$4,'message',$5))", ex.ProjectID, ex.RunID, ex.AttemptID, percent, truncate(message, 500))
+	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,'job.progress','job_run',$2,jsonb_build_object('attempt_id',$3::uuid,'percent',$4::integer,'message',$5::text))", ex.ProjectID, ex.RunID, ex.AttemptID, percent, truncate(message, 500))
 	if err != nil {
 		return err
 	}

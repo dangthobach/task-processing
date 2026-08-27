@@ -17,25 +17,35 @@ type baselineRequirement struct {
 	table      string
 	column     string
 	index      string
+	constraint string
+	trigger    string
 }
 
 var baselineRequirements = []baselineRequirement{
-	{1, "tenants", "id", ""}, {1, "projects", "tenant_id", ""},
-	{1, "queues", "max_concurrency", ""}, {1, "job_definitions", "function_id", ""},
-	{1, "schedules", "run_at", ""}, {1, "job_runs", "policy_snapshot", ""},
-	{2, "scheduler_logs", "occurred_at", ""},
-	{3, "function_definitions", "max_concurrency", ""},
-	{5, "job_batches", "status", ""}, {5, "batch_items", "job_run_id", ""},
-	{6, "queues", "row_version", ""}, {6, "job_runs", "row_version", ""},
-	{7, "audit_outbox_events", "aggregate_id", ""}, {7, "queues", "deleted_at", ""},
-	{9, "", "", "ux_queues_active_name"}, {9, "", "", "ux_retry_policies_active_name"},
-	{10, "job_logs", "created_at", ""}, {10, "job_logs_default", "", ""},
-	{10, "workflow_definitions", "status", ""}, {10, "workflow_node_runs", "status", ""},
-	{11, "users", "subject", ""}, {11, "roles", "role_key", ""}, {11, "permissions", "permission_key", ""},
-	{12, "rate_limit_policies", "scope", ""}, {12, "rate_limit_buckets", "tokens", ""},
-	{12, "", "", "ux_rate_limit_active_name"},
-	{21, "audit_outbox_events", "claim_token", ""},
-	{22, "job_runs", "payload_rewrapped_at", ""},
+	{introduced: 1, table: "tenants", column: "id"}, {introduced: 1, table: "projects", column: "tenant_id"},
+	{introduced: 1, table: "queues", column: "max_concurrency"}, {introduced: 1, table: "job_definitions", column: "function_id"},
+	{introduced: 1, table: "schedules", column: "run_at"}, {introduced: 1, table: "job_runs", column: "policy_snapshot"},
+	{introduced: 2, table: "scheduler_logs", column: "occurred_at"},
+	{introduced: 3, table: "function_definitions", column: "max_concurrency"},
+	{introduced: 5, table: "job_batches", column: "status"}, {introduced: 5, table: "job_batch_items", column: "job_run_id"},
+	{introduced: 6, table: "queues", column: "row_version"}, {introduced: 6, table: "job_runs", column: "row_version"},
+	{introduced: 7, table: "audit_outbox_events", column: "aggregate_id"}, {introduced: 7, table: "queues", column: "deleted_at"},
+	{introduced: 9, index: "ux_queues_active_name"}, {introduced: 9, index: "ux_retry_policies_active_name"},
+	{introduced: 10, table: "job_logs", column: "created_at"}, {introduced: 10, table: "job_logs_default"},
+	{introduced: 10, table: "workflow_definitions", column: "status"}, {introduced: 10, table: "workflow_node_runs", column: "status"},
+	{introduced: 11, table: "users", column: "subject"}, {introduced: 11, table: "roles", column: "role_key"}, {introduced: 11, table: "permissions", column: "permission_key"},
+	{introduced: 12, table: "rate_limit_policies", column: "scope"}, {introduced: 12, table: "rate_limit_buckets", column: "tokens"},
+	{introduced: 12, index: "ux_rate_limit_active_name"},
+	{introduced: 21, table: "audit_outbox_events", column: "claim_token"},
+	{introduced: 22, table: "job_runs", column: "payload_rewrapped_at"},
+	{introduced: 23, table: "job_runs", column: "traceparent"}, {introduced: 23, table: "job_runs", column: "tracestate"},
+	{introduced: 23, table: "job_runs", constraint: "ck_job_runs_traceparent_length"},
+	{introduced: 23, table: "job_runs", constraint: "ck_job_runs_tracestate_length"},
+	{introduced: 24, table: "worker_function_capabilities", column: "function_version"},
+	{introduced: 24, index: "ix_worker_capabilities_lookup"},
+	{introduced: 24, table: "job_definitions", trigger: "trg_job_definitions_require_worker_capability"},
+	{introduced: 25, table: "job_batches", column: "lease_token"}, {introduced: 25, index: "ix_job_batches_recovery_lease"},
+	{introduced: 26, table: "outbox_events", column: "expired_at"}, {introduced: 26, index: "ix_outbox_claimable_live"},
 }
 
 // VerifyBaseline validates the minimum relational fingerprint for an existing
@@ -84,6 +94,34 @@ func VerifyBaseline(ctx context.Context, conn *pgxpool.Conn, through int64) erro
 			}
 			if !exists {
 				return fmt.Errorf("unsafe baseline through %d: required index %q is missing", through, requirement.index)
+			}
+		}
+		if requirement.constraint != "" {
+			var exists bool
+			if err := conn.QueryRow(ctx, `SELECT EXISTS(
+				SELECT 1 FROM pg_catalog.pg_constraint c
+				JOIN pg_catalog.pg_class r ON r.oid=c.conrelid
+				JOIN pg_catalog.pg_namespace n ON n.oid=r.relnamespace
+				WHERE n.nspname=current_schema() AND r.relname=$1 AND c.conname=$2
+			)`, requirement.table, requirement.constraint).Scan(&exists); err != nil {
+				return fmt.Errorf("inspect baseline constraint %s.%s: %w", requirement.table, requirement.constraint, err)
+			}
+			if !exists {
+				return fmt.Errorf("unsafe baseline through %d: required constraint %q.%q is missing", through, requirement.table, requirement.constraint)
+			}
+		}
+		if requirement.trigger != "" {
+			var exists bool
+			if err := conn.QueryRow(ctx, `SELECT EXISTS(
+				SELECT 1 FROM pg_catalog.pg_trigger t
+				JOIN pg_catalog.pg_class r ON r.oid=t.tgrelid
+				JOIN pg_catalog.pg_namespace n ON n.oid=r.relnamespace
+				WHERE n.nspname=current_schema() AND r.relname=$1 AND t.tgname=$2 AND NOT t.tgisinternal
+			)`, requirement.table, requirement.trigger).Scan(&exists); err != nil {
+				return fmt.Errorf("inspect baseline trigger %s.%s: %w", requirement.table, requirement.trigger, err)
+			}
+			if !exists {
+				return fmt.Errorf("unsafe baseline through %d: required trigger %q.%q is missing", through, requirement.table, requirement.trigger)
 			}
 		}
 	}

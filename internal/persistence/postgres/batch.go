@@ -7,6 +7,7 @@ import (
 	"github.com/example/task-processing/internal/domain/job"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"go.opentelemetry.io/otel/trace"
 	"strings"
 	"time"
@@ -53,22 +54,29 @@ func (s *Store) ClaimBatches(ctx context.Context, worker uuid.UUID, owner string
 			continue
 		}
 		batch := uuid.New()
-		_, err = tx.Exec(ctx, `INSERT INTO job_batches(id,project_id,queue_id,job_definition_id,worker_id,lease_owner,lease_expires_at,status,total_items) VALUES($1,$2,$3,$4,$5,$6,now()+($7 * interval '1 millisecond'),'RESERVED',$8)`, batch, project, queue, definition, worker, owner, lease.Milliseconds(), len(runs))
+		leaseToken := uuid.New()
+		_, err = tx.Exec(ctx, `INSERT INTO job_batches(id,project_id,queue_id,job_definition_id,worker_id,lease_owner,lease_token,lease_expires_at,status,total_items) VALUES($1,$2,$3,$4,$5,$6,$7,now()+($8::bigint * interval '1 millisecond'),'RESERVED',$9)`, batch, project, queue, definition, worker, owner, leaseToken, lease.Milliseconds(), len(runs))
 		if err != nil {
 			_ = tx.Rollback(ctx)
 			return batches, err
 		}
 		for ordinal, run := range runs {
-			if _, err = tx.Exec(ctx, "UPDATE job_runs SET status='RESERVED',lease_owner=$2,lease_expires_at=now()+($3 * interval '1 millisecond'),reserved_at=now(),updated_at=now() WHERE id=$1", run, owner, lease.Milliseconds()); err != nil {
+			tag, updateErr := tx.Exec(ctx, "UPDATE job_runs SET status='RESERVED',lease_owner=$2,lease_token=$3,lease_expires_at=now()+($4::bigint * interval '1 millisecond'),reserved_at=now(),updated_at=now() WHERE id=$1 AND status='QUEUED'", run, owner, leaseToken, lease.Milliseconds())
+			if updateErr != nil {
+				err = updateErr
 				_ = tx.Rollback(ctx)
 				return batches, err
+			}
+			if tag.RowsAffected() != 1 {
+				_ = tx.Rollback(ctx)
+				return batches, ErrLeaseLost
 			}
 			if _, err = tx.Exec(ctx, "INSERT INTO job_batch_items(batch_id,job_run_id,ordinal) VALUES($1,$2,$3)", batch, run, ordinal); err != nil {
 				_ = tx.Rollback(ctx)
 				return batches, err
 			}
 		}
-		if _, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,'batch.reserved','job_batch',$2,jsonb_build_object('total_items',$3))", project, batch, len(runs)); err != nil {
+		if _, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,'batch.reserved','job_batch',$2,jsonb_build_object('total_items',$3::integer))", project, batch, len(runs)); err != nil {
 			_ = tx.Rollback(ctx)
 			return batches, err
 		}
@@ -91,7 +99,7 @@ func (s *Store) StartBatch(ctx context.Context, batchID, worker uuid.UUID, owner
 	}
 	var b job.BatchExecution
 	var policy []byte
-	err = tx.QueryRow(ctx, `SELECT b.project_id,b.queue_id,b.job_definition_id,fd.function_key,r.policy_snapshot FROM job_batches b JOIN job_definitions jd ON jd.id=b.job_definition_id JOIN function_definitions fd ON fd.id=jd.function_id JOIN job_batch_items bi ON bi.batch_id=b.id JOIN job_runs r ON r.id=bi.job_run_id WHERE b.id=$1 AND b.status='RESERVED' AND b.lease_owner=$2 ORDER BY bi.ordinal LIMIT 1 FOR UPDATE OF b`, batchID, owner).Scan(&b.ProjectID, &b.QueueID, &b.DefinitionID, &b.FunctionKey, &policy)
+	err = tx.QueryRow(ctx, `SELECT b.project_id,b.queue_id,b.job_definition_id,fd.function_key,r.function_version,r.policy_snapshot,b.lease_token,b.lease_expires_at FROM job_batches b JOIN job_definitions jd ON jd.id=b.job_definition_id JOIN function_definitions fd ON fd.id=jd.function_id JOIN job_batch_items bi ON bi.batch_id=b.id JOIN job_runs r ON r.id=bi.job_run_id WHERE b.id=$1 AND b.status='RESERVED' AND b.lease_owner=$2 AND b.lease_token IS NOT NULL AND b.lease_expires_at>now() ORDER BY bi.ordinal LIMIT 1 FOR UPDATE OF b`, batchID, owner).Scan(&b.ProjectID, &b.QueueID, &b.DefinitionID, &b.FunctionKey, &b.FunctionVersion, &policy, &b.LeaseToken, &b.LeaseExpiresAt)
 	if err != nil {
 		return b, err
 	}
@@ -103,10 +111,12 @@ func (s *Store) StartBatch(ctx context.Context, batchID, worker uuid.UUID, owner
 		return b, err
 	}
 	attempt := uuid.New()
-	_, err = tx.Exec(ctx, "UPDATE job_batches SET status='RUNNING',started_at=COALESCE(started_at,now()),lease_expires_at=now()+($3 * interval '1 millisecond') WHERE id=$1 AND lease_owner=$2", batchID, owner, lease.Milliseconds())
+	var expiry time.Time
+	err = tx.QueryRow(ctx, "UPDATE job_batches SET status='RUNNING',started_at=COALESCE(started_at,now()),lease_expires_at=now()+($4::bigint * interval '1 millisecond') WHERE id=$1 AND status='RESERVED' AND lease_owner=$2 AND lease_token=$3 AND lease_expires_at>now() RETURNING lease_expires_at", batchID, owner, b.LeaseToken, lease.Milliseconds()).Scan(&expiry)
 	if err != nil {
 		return b, err
 	}
+	b.LeaseExpiresAt = expiry
 	traceID := ""
 	if span := trace.SpanContextFromContext(ctx); span.IsValid() {
 		traceID = span.TraceID().String()
@@ -115,7 +125,7 @@ func (s *Store) StartBatch(ctx context.Context, batchID, worker uuid.UUID, owner
 	if err != nil {
 		return b, err
 	}
-	rows, err := tx.Query(ctx, `SELECT bi.id,bi.ordinal,r.id,r.project_id,r.queue_id,r.job_definition_id,r.idempotency_key,r.payload,r.payload_ciphertext,COALESCE(r.encryption_key_ref,''),r.function_version,r.policy_snapshot FROM job_batch_items bi JOIN job_runs r ON r.id=bi.job_run_id WHERE bi.batch_id=$1 ORDER BY bi.ordinal`, batchID)
+	rows, err := tx.Query(ctx, `SELECT bi.id,bi.ordinal,r.id,r.project_id,r.queue_id,r.job_definition_id,COALESCE(r.idempotency_key,''),r.payload,r.payload_ciphertext,COALESCE(r.encryption_key_ref,''),r.function_version,r.policy_snapshot FROM job_batch_items bi JOIN job_runs r ON r.id=bi.job_run_id WHERE bi.batch_id=$1 ORDER BY bi.ordinal`, batchID)
 	if err != nil {
 		return b, err
 	}
@@ -147,9 +157,13 @@ func (s *Store) StartBatch(ctx context.Context, batchID, worker uuid.UUID, owner
 		}
 		item.Run.AttemptID = uuid.New()
 		item.Run.Attempt = itemAttempt
-		_, err = tx.Exec(ctx, "UPDATE job_runs SET status='RUNNING',started_at=COALESCE(started_at,now()),lease_expires_at=now()+($3 * interval '1 millisecond') WHERE id=$1 AND status='RESERVED' AND lease_owner=$2", item.Run.RunID, owner, lease.Milliseconds())
+		var tag pgconn.CommandTag
+		tag, err = tx.Exec(ctx, "UPDATE job_runs SET status='RUNNING',started_at=COALESCE(started_at,now()),lease_expires_at=now()+($4::bigint * interval '1 millisecond') WHERE id=$1 AND status='RESERVED' AND lease_owner=$2 AND lease_token=$3 AND lease_expires_at>now()", item.Run.RunID, owner, b.LeaseToken, lease.Milliseconds())
 		if err != nil {
 			return b, err
+		}
+		if tag.RowsAffected() != 1 {
+			return b, ErrLeaseLost
 		}
 		_, err = tx.Exec(ctx, "INSERT INTO job_attempts(id,job_run_id,worker_id,batch_attempt_id,attempt_number,status) VALUES($1,$2,$3,$4,$5,'RUNNING')", item.Run.AttemptID, item.Run.RunID, worker, attempt, itemAttempt)
 		if err != nil {
@@ -163,7 +177,7 @@ func (s *Store) StartBatch(ctx context.Context, batchID, worker uuid.UUID, owner
 	if err != nil {
 		return b, err
 	}
-	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,'batch.started','job_batch',$2,jsonb_build_object('attempt_id',$3,'total_items',$4))", b.ProjectID, batchID, attempt, len(b.Items))
+	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,'batch.started','job_batch',$2,jsonb_build_object('attempt_id',$3::uuid,'total_items',$4::integer))", b.ProjectID, batchID, attempt, len(b.Items))
 	if err != nil {
 		return b, err
 	}
@@ -180,6 +194,16 @@ func (s *Store) CompleteBatch(ctx context.Context, b *job.BatchExecution, owner 
 	}
 	defer tx.Rollback(ctx)
 	if err = setSystemAuditContext(ctx, tx); err != nil {
+		return err
+	}
+	// Lock and verify aggregate ownership once before any item mutation. Every
+	// write below repeats the fence as defence in depth; this prevents a worker
+	// that wakes after recovery from committing a partial batch result.
+	var held bool
+	if err = tx.QueryRow(ctx, "SELECT true FROM job_batches WHERE id=$1 AND status='RUNNING' AND lease_owner=$2 AND lease_token=$3 AND lease_expires_at>now() FOR UPDATE", b.BatchID, owner, b.LeaseToken).Scan(&held); err != nil {
+		if err == pgx.ErrNoRows {
+			return ErrLeaseLost
+		}
 		return err
 	}
 	byID := map[uuid.UUID]job.BatchItemResult{}
@@ -205,8 +229,13 @@ func (s *Store) CompleteBatch(ctx context.Context, b *job.BatchExecution, owner 
 		}
 		if itemErr == nil {
 			successes++
-			if _, err = tx.Exec(ctx, "UPDATE job_runs SET status='SUCCEEDED',finished_at=now(),lease_owner=NULL,lease_expires_at=NULL,updated_at=now() WHERE id=$1 AND status='RUNNING' AND lease_owner=$2", item.Run.RunID, owner); err != nil {
+			tag, updateErr := tx.Exec(ctx, "UPDATE job_runs SET status='SUCCEEDED',finished_at=now(),lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=now() WHERE id=$1 AND status='RUNNING' AND lease_owner=$2 AND lease_token=$3 AND lease_expires_at>now()", item.Run.RunID, owner, b.LeaseToken)
+			if updateErr != nil {
+				err = updateErr
 				return err
+			}
+			if tag.RowsAffected() != 1 {
+				return ErrLeaseLost
 			}
 			if _, err = tx.Exec(ctx, "UPDATE job_attempts SET status='SUCCEEDED',progress_pct=100,finished_at=now(),updated_at=now() WHERE id=$1", item.Run.AttemptID); err != nil {
 				return err
@@ -228,8 +257,13 @@ func (s *Store) CompleteBatch(ctx context.Context, b *job.BatchExecution, owner 
 			available = job.NextRetry(available, item.Run.Attempt, item.Run.Policy.Retry, nil)
 			retries++
 		}
-		if _, err = tx.Exec(ctx, "UPDATE job_runs SET status=$3,available_at=$4,finished_at=CASE WHEN $3='DEAD_LETTER' THEN now() ELSE NULL END,lease_owner=NULL,lease_expires_at=NULL,updated_at=now() WHERE id=$1 AND status='RUNNING' AND lease_owner=$2", item.Run.RunID, owner, status, available); err != nil {
+		tag, updateErr := tx.Exec(ctx, "UPDATE job_runs SET status=$4,available_at=$5,finished_at=CASE WHEN $4='DEAD_LETTER' THEN now() ELSE NULL END,lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=now() WHERE id=$1 AND status='RUNNING' AND lease_owner=$2 AND lease_token=$3 AND lease_expires_at>now()", item.Run.RunID, owner, b.LeaseToken, status, available)
+		if updateErr != nil {
+			err = updateErr
 			return err
+		}
+		if tag.RowsAffected() != 1 {
+			return ErrLeaseLost
 		}
 		if _, err = tx.Exec(ctx, "UPDATE job_attempts SET status='FAILED',error_class=$2,error_code=$3,error_message=$4,finished_at=now(),updated_at=now() WHERE id=$1", item.Run.AttemptID, classified.Class, classified.Code, truncate(classified.Error(), 1000)); err != nil {
 			return err
@@ -250,67 +284,95 @@ func (s *Store) CompleteBatch(ctx context.Context, b *job.BatchExecution, owner 
 	if failures > 0 && successes == 0 {
 		batchStatus = "FAILED"
 	}
-	_, err = tx.Exec(ctx, "UPDATE job_batches SET status=$2,processed_items=$3,succeeded_items=$4,failed_items=$5,retry_scheduled_items=$6,finished_at=now(),lease_owner=NULL,lease_expires_at=NULL WHERE id=$1 AND status='RUNNING' AND lease_owner=$7", b.BatchID, batchStatus, len(b.Items), successes, failures, retries, owner)
+	tag, updateErr := tx.Exec(ctx, "UPDATE job_batches SET status=$3,processed_items=$4,succeeded_items=$5,failed_items=$6,retry_scheduled_items=$7,finished_at=now(),lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE id=$1 AND status='RUNNING' AND lease_owner=$2 AND lease_token=$8 AND lease_expires_at>now()", b.BatchID, owner, batchStatus, len(b.Items), successes, failures, retries, b.LeaseToken)
+	if updateErr != nil {
+		return updateErr
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrLeaseLost
+	}
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, "UPDATE job_batch_attempts SET status=$2,processed_items=$3,succeeded_items=$4,failed_items=$5,progress_pct=100,finished_at=now() WHERE id=$1", b.AttemptID, batchStatus, len(b.Items), successes, failures)
+	tag, err = tx.Exec(ctx, "UPDATE job_batch_attempts SET status=$3,processed_items=$4,succeeded_items=$5,failed_items=$6,progress_pct=100,finished_at=now() WHERE id=$1 AND batch_id=$2 AND status='RUNNING'", b.AttemptID, b.BatchID, batchStatus, len(b.Items), successes, failures)
 	if err != nil {
 		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return ErrLeaseLost
 	}
 	level := "INFO"
 	if failures > 0 {
 		level = "ERROR"
 	}
-	_, err = tx.Exec(ctx, "INSERT INTO job_batch_logs(project_id,batch_id,batch_attempt_id,level,message,fields) VALUES($1,$2,$3,$4,'batch handler completed',jsonb_build_object('succeeded',$5,'failed',$6,'retry_scheduled',$7))", b.ProjectID, b.BatchID, b.AttemptID, level, successes, failures, retries)
+	_, err = tx.Exec(ctx, "INSERT INTO job_batch_logs(project_id,batch_id,batch_attempt_id,level,message,fields) VALUES($1,$2,$3,$4,'batch handler completed',jsonb_build_object('succeeded',$5::integer,'failed',$6::integer,'retry_scheduled',$7::integer))", b.ProjectID, b.BatchID, b.AttemptID, level, successes, failures, retries)
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,$2,'job_batch',$3,jsonb_build_object('succeeded',$4,'failed',$5,'retry_scheduled',$6))", b.ProjectID, "batch."+strings.ToLower(batchStatus), b.BatchID, successes, failures, retries)
+	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,$2,'job_batch',$3,jsonb_build_object('succeeded',$4::integer,'failed',$5::integer,'retry_scheduled',$6::integer))", b.ProjectID, "batch."+strings.ToLower(batchStatus), b.BatchID, successes, failures, retries)
 	if err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 func (s *Store) ReportBatchProgress(ctx context.Context, b *job.BatchExecution, processed int, message string) error {
+	if b == nil || len(b.Items) == 0 || processed < 0 || processed > len(b.Items) {
+		return fmt.Errorf("invalid batch progress")
+	}
 	pct := processed * 100 / len(b.Items)
 	tx, err := s.Pool.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer tx.Rollback(ctx)
-	_, err = tx.Exec(ctx, "UPDATE job_batch_attempts SET processed_items=$2,progress_pct=$3,progress_message=$4 WHERE id=$1 AND status='RUNNING'", b.AttemptID, processed, pct, truncate(message, 500))
+	tag, err := tx.Exec(ctx, "UPDATE job_batch_attempts a SET processed_items=$3,progress_pct=$4,progress_message=$5 WHERE a.id=$1 AND a.batch_id=$2 AND a.status='RUNNING' AND EXISTS(SELECT 1 FROM job_batches b WHERE b.id=$2 AND b.status='RUNNING' AND b.lease_token=$6 AND b.lease_expires_at>now())", b.AttemptID, b.BatchID, processed, pct, truncate(message, 500), b.LeaseToken)
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, "UPDATE job_batches SET processed_items=$2 WHERE id=$1 AND status='RUNNING'", b.BatchID, processed)
+	if tag.RowsAffected() != 1 {
+		return ErrLeaseLost
+	}
+	tag, err = tx.Exec(ctx, "UPDATE job_batches SET processed_items=$2 WHERE id=$1 AND status='RUNNING' AND lease_token=$3 AND lease_expires_at>now()", b.BatchID, processed, b.LeaseToken)
 	if err != nil {
 		return err
 	}
-	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,'batch.progress','job_batch',$2,jsonb_build_object('attempt_id',$3,'processed',$4,'total',$5,'percent',$6,'message',$7))", b.ProjectID, b.BatchID, b.AttemptID, processed, len(b.Items), pct, truncate(message, 500))
+	if tag.RowsAffected() != 1 {
+		return ErrLeaseLost
+	}
+	_, err = tx.Exec(ctx, "INSERT INTO realtime_events(project_id,event_type,aggregate_type,aggregate_id,payload) VALUES($1,'batch.progress','job_batch',$2,jsonb_build_object('attempt_id',$3::uuid,'processed',$4::integer,'total',$5::integer,'percent',$6::integer,'message',$7::text))", b.ProjectID, b.BatchID, b.AttemptID, processed, len(b.Items), pct, truncate(message, 500))
 	if err != nil {
 		return err
 	}
 	return tx.Commit(ctx)
 }
 func (s *Store) WriteBatchLog(ctx context.Context, b *job.BatchExecution, level, message string, fields map[string]any) error {
+	if b == nil {
+		return fmt.Errorf("batch execution is required")
+	}
 	raw, err := json.Marshal(fields)
 	if err != nil {
 		return err
 	}
-	_, err = s.Pool.Exec(ctx, "INSERT INTO job_batch_logs(project_id,batch_id,batch_attempt_id,level,message,fields) VALUES($1,$2,$3,$4,$5,$6)", b.ProjectID, b.BatchID, b.AttemptID, level, truncate(message, 2000), raw)
-	return err
-}
-
-func (s *Store) ExtendBatchLease(ctx context.Context, batch uuid.UUID, owner string, lease time.Duration) error {
-	tag, err := s.Pool.Exec(ctx, "UPDATE job_batches SET lease_expires_at=now()+($3 * interval '1 millisecond') WHERE id=$1 AND status='RUNNING' AND lease_owner=$2", batch, owner, lease.Milliseconds())
+	tag, err := s.Pool.Exec(ctx, "INSERT INTO job_batch_logs(project_id,batch_id,batch_attempt_id,level,message,fields) SELECT $1,$2,$3,$4,$5,$6 WHERE EXISTS(SELECT 1 FROM job_batches WHERE id=$2 AND status='RUNNING' AND lease_token=$7 AND lease_expires_at>now())", b.ProjectID, b.BatchID, b.AttemptID, level, truncate(message, 2000), raw, b.LeaseToken)
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() != 1 {
-		return fmt.Errorf("batch %s lease cannot be extended", batch)
+		return ErrLeaseLost
 	}
 	return nil
+}
+
+func (s *Store) ExtendBatchLease(ctx context.Context, batch uuid.UUID, owner string, token uuid.UUID, lease time.Duration) (time.Time, error) {
+	var expiry time.Time
+	err := s.Pool.QueryRow(ctx, "UPDATE job_batches SET lease_expires_at=now()+($4::bigint * interval '1 millisecond') WHERE id=$1 AND status='RUNNING' AND lease_owner=$2 AND lease_token=$3 AND lease_expires_at>now() RETURNING lease_expires_at", batch, owner, token, lease.Milliseconds()).Scan(&expiry)
+	if err != nil {
+		if err == pgx.ErrNoRows {
+			return time.Time{}, ErrLeaseLost
+		}
+		return time.Time{}, err
+	}
+	return expiry, nil
 }
 func (s *Store) RecoverExpiredBatches(ctx context.Context) (int, error) {
 	tx, err := s.Pool.Begin(ctx)
@@ -334,7 +396,7 @@ func (s *Store) RecoverExpiredBatches(ctx context.Context) (int, error) {
 	}
 	rows.Close()
 	for _, e := range found {
-		if _, err = tx.Exec(ctx, "UPDATE job_runs SET status='QUEUED',lease_owner=NULL,lease_expires_at=NULL,updated_at=now() WHERE id IN(SELECT job_run_id FROM job_batch_items WHERE batch_id=$1) AND status IN ('RESERVED','RUNNING')", e.id); err != nil {
+		if _, err = tx.Exec(ctx, "UPDATE job_runs SET status='QUEUED',lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL,updated_at=now() WHERE id IN(SELECT job_run_id FROM job_batch_items WHERE batch_id=$1) AND status IN ('RESERVED','RUNNING')", e.id); err != nil {
 			return 0, err
 		}
 		if _, err = tx.Exec(ctx, "UPDATE job_batch_items SET status='FAILED',error_class='TRANSIENT',error_code='LEASE_EXPIRED',error_message='batch worker lease expired',completed_at=now() WHERE batch_id=$1 AND status='PENDING'", e.id); err != nil {
@@ -346,7 +408,7 @@ func (s *Store) RecoverExpiredBatches(ctx context.Context) (int, error) {
 		if _, err = tx.Exec(ctx, "UPDATE job_batch_attempts SET status='FAILED',finished_at=now(),progress_message='worker lease expired' WHERE batch_id=$1 AND status='RUNNING'", e.id); err != nil {
 			return 0, err
 		}
-		if _, err = tx.Exec(ctx, "UPDATE job_batches SET status='FAILED',finished_at=now(),lease_owner=NULL,lease_expires_at=NULL WHERE id=$1", e.id); err != nil {
+		if _, err = tx.Exec(ctx, "UPDATE job_batches SET status='FAILED',finished_at=now(),lease_owner=NULL,lease_token=NULL,lease_expires_at=NULL WHERE id=$1", e.id); err != nil {
 			return 0, err
 		}
 		if _, err = tx.Exec(ctx, "INSERT INTO job_batch_logs(project_id,batch_id,level,message) VALUES($1,$2,'ERROR','batch lease expired; items requeued')", e.project, e.id); err != nil {

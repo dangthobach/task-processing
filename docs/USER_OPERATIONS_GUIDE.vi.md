@@ -167,7 +167,9 @@ API hiện hỗ trợ `enforcement_point` là `WORKER_START` hoặc `SUBMISSION`
 
 ### Batch
 
-- `RESERVED`/`RUNNING`: batch handler đang sở hữu nhóm item.
+- `RESERVED`/`RUNNING`: batch handler đang sở hữu nhóm item bằng lease token
+  (fenced ownership). Khi lease hết hạn, recovery requeue item và handler cũ
+  không thể ghi progress/kết quả muộn.
 - Thành công/thất bại hiển thị ở từng item: một item fail có thể retry/DLQ độc lập, không che giấu item thành công.
 - Bấm batch trong **Batches** để xem progress, items, attempts và structured logs.
 

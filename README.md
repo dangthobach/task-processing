@@ -15,6 +15,16 @@ go run ./cmd/worker
 go run ./cmd/scheduler
 ```
 
+If SQL migrations were applied manually and `schema_migrations` is only
+partially recorded, do not rerun DDL or insert history by hand. Use the guarded
+repair path; it verifies required tables, columns, indexes, constraints and
+triggers before it records only proven versions:
+
+```powershell
+$env:MIGRATION_REPAIR_LEDGER_THROUGH = '26'
+go run ./cmd/migrate
+```
+
 ## React control-plane UI
 
 The React/Vite console lives in [`frontend/`](frontend/). It is a responsive operations UI for runs, batches, DLQ, worker fleet, scheduler logs, audit history, realtime events, and creation flows for jobs, queues, definitions and schedules.
@@ -30,6 +40,7 @@ Open `http://localhost:5173`. The Vite proxy sends `/api` and `/metrics` to the 
 The common HTTP envelope, distributed tracing, audit and optimistic-locking rules are in [docs/API_CONTRACT.md](docs/API_CONTRACT.md).
 The exact backend-to-React endpoint mapping is in [docs/API_FE_MAPPING.md](docs/API_FE_MAPPING.md).
 The portable queue semantics and PostgreSQL adapter are in [docs/QUEUE_BACKENDS.md](docs/QUEUE_BACKENDS.md).
+The high-throughput handler middleware contract and tuning guidance are in [docs/MIDDLEWARE_RUNTIME.md](docs/MIDDLEWARE_RUNTIME.md).
 The Vietnamese operator walkthrough, UI enum reference and BRD follow-up backlog are in [docs/USER_OPERATIONS_GUIDE.vi.md](docs/USER_OPERATIONS_GUIDE.vi.md).
 
 The API listens on `:8080`; open `http://localhost:8080/` for the small operational dashboard. Development identity headers are required for protected routes:

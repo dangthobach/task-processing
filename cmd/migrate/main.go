@@ -28,16 +28,26 @@ func main() {
 			panic("MIGRATION_BASELINE_THROUGH must be a non-negative integer")
 		}
 	}
+	repair := int64(0)
+	if raw := os.Getenv("MIGRATION_REPAIR_LEDGER_THROUGH"); raw != "" {
+		repair, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || repair < 0 {
+			panic("MIGRATION_REPAIR_LEDGER_THROUGH must be a non-negative integer")
+		}
+	}
 	loaded, err := migration.Load(migrations.FS)
 	if err != nil {
 		panic(err)
 	}
-	result, err := migration.Run(ctx, store.Pool, loaded, migration.Options{BaselineThrough: baseline})
+	result, err := migration.Run(ctx, store.Pool, loaded, migration.Options{BaselineThrough: baseline, RepairLedgerThrough: repair})
 	if err != nil {
 		panic(err)
 	}
 	for _, version := range result.Baselined {
 		fmt.Println("baselined", version)
+	}
+	for _, version := range result.Repaired {
+		fmt.Println("repaired ledger", version)
 	}
 	for _, version := range result.Applied {
 		fmt.Println("applied", version)

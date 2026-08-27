@@ -58,6 +58,10 @@ type ReserveRequest struct {
 	Owner    string
 	Limit    int
 	Lease    time.Duration
+	// PollWait bounds one transport poll. Backends must return promptly when it
+	// elapses so a slow/empty broker cannot starve worker heartbeats, lease
+	// recovery or the PostgreSQL outbox loop.
+	PollWait time.Duration
 }
 
 type Delivery struct {
@@ -76,9 +80,9 @@ type Delivery struct {
 // retain receipts until PostgreSQL persists every item result.
 type BatchReserveRequest struct {
 	ReserveRequest
-	QueueID        uuid.UUID
-	MaxItems       int
-	MaxWait        time.Duration
+	QueueID         uuid.UUID
+	MaxItems        int
+	MaxWait         time.Duration
 	BatchGeneration uuid.UUID
 }
 type BatchDelivery struct {

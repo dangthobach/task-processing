@@ -26,3 +26,24 @@ func TestSlotsReserveAtomically(t *testing.T) {
 		t.Fatalf("reserve=%d", got)
 	}
 }
+
+func TestLoadConfigBuildsOptInMiddleware(t *testing.T) {
+	cfg, err := LoadConfig(func(name string) string {
+		switch name {
+		case "WORKER_CIRCUIT_BREAKER_FAILURES":
+			return "3"
+		case "WORKER_BULKHEAD_LIMIT":
+			return "5"
+		case "WORKER_MIN_EXECUTION_BUDGET_MS":
+			return "25"
+		default:
+			return ""
+		}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.MiddlewareStack()) != 3 {
+		t.Fatalf("middleware=%d", len(cfg.MiddlewareStack()))
+	}
+}

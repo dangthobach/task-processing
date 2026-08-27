@@ -3,11 +3,17 @@
 package middleware
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/example/task-processing/internal/domain/job"
+)
+
+var (
+	ErrCircuitOpen  = errors.New("circuit breaker is open")
+	ErrBulkheadFull = errors.New("bulkhead capacity is exhausted")
 )
 
 type Middleware func(job.Handler) job.Handler

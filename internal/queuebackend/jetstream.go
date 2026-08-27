@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/example/task-processing/internal/domain/job"
@@ -31,10 +32,12 @@ type JetStreamBackend struct {
 	JS     nats.JetStreamContext
 	Config JetStreamConfig
 
-	ensureOnce sync.Once
-	ensureErr  error
-	receiptsMu sync.Mutex
-	receipts   map[string]*nats.Msg
+	ensureMu    sync.Mutex
+	ensureReady atomic.Bool
+	subMu       sync.Mutex
+	sub         *nats.Subscription
+	receiptsMu  sync.Mutex
+	receipts    map[string]*nats.Msg
 }
 
 func NewJetStream(s *store.Store, cfg JetStreamConfig) (*JetStreamBackend, error) {
@@ -64,30 +67,32 @@ func (b *JetStreamBackend) Capabilities() Capabilities {
 	return Capabilities{NativePriority: false, NativeDelay: false, NativeDLQ: false, NativePause: false, AtomicBatch: false, ConsumerGroups: true}
 }
 func (b *JetStreamBackend) ensure(ctx context.Context) error {
-	b.ensureOnce.Do(func() {
-		if _, err := b.JS.StreamInfo(b.Config.Stream, nats.Context(ctx)); err != nil {
-			if !errors.Is(err, nats.ErrStreamNotFound) {
-				b.ensureErr = err
-				return
-			}
-			_, err = b.JS.AddStream(&nats.StreamConfig{Name: b.Config.Stream, Subjects: []string{b.Config.Subject}, Storage: nats.FileStorage, Retention: nats.WorkQueuePolicy})
-			if err != nil && !errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
-				b.ensureErr = err
-				return
-			}
+	if b.ensureReady.Load() {
+		return nil
+	}
+	b.ensureMu.Lock()
+	defer b.ensureMu.Unlock()
+	if b.ensureReady.Load() {
+		return nil
+	}
+	if _, err := b.JS.StreamInfo(b.Config.Stream, nats.Context(ctx)); err != nil {
+		if !errors.Is(err, nats.ErrStreamNotFound) {
+			return err
 		}
-		if _, err := b.JS.ConsumerInfo(b.Config.Stream, b.Config.Consumer, nats.Context(ctx)); err != nil {
-			if !errors.Is(err, nats.ErrConsumerNotFound) {
-				b.ensureErr = err
-				return
-			}
-			_, err = b.JS.AddConsumer(b.Config.Stream, &nats.ConsumerConfig{Durable: b.Config.Consumer, AckPolicy: nats.AckExplicitPolicy, AckWait: b.Config.AckWait, FilterSubject: b.Config.Subject, MaxAckPending: 1000})
-			if err != nil && !errors.Is(err, nats.ErrConsumerNameAlreadyInUse) {
-				b.ensureErr = err
-			}
+		if _, err = b.JS.AddStream(&nats.StreamConfig{Name: b.Config.Stream, Subjects: []string{b.Config.Subject}, Storage: nats.FileStorage, Retention: nats.WorkQueuePolicy}); err != nil && !errors.Is(err, nats.ErrStreamNameAlreadyInUse) {
+			return err
 		}
-	})
-	return b.ensureErr
+	}
+	if _, err := b.JS.ConsumerInfo(b.Config.Stream, b.Config.Consumer, nats.Context(ctx)); err != nil {
+		if !errors.Is(err, nats.ErrConsumerNotFound) {
+			return err
+		}
+		if _, err = b.JS.AddConsumer(b.Config.Stream, &nats.ConsumerConfig{Durable: b.Config.Consumer, AckPolicy: nats.AckExplicitPolicy, AckWait: b.Config.AckWait, FilterSubject: b.Config.Subject, MaxAckPending: 1000}); err != nil && !errors.Is(err, nats.ErrConsumerNameAlreadyInUse) {
+			return err
+		}
+	}
+	b.ensureReady.Store(true)
+	return nil
 }
 func (b *JetStreamBackend) Enqueue(ctx context.Context, message Message) error {
 	if err := message.Validate(); err != nil {
@@ -121,12 +126,15 @@ func (b *JetStreamBackend) Reserve(ctx context.Context, req ReserveRequest) ([]D
 	if err := b.ensure(ctx); err != nil {
 		return nil, err
 	}
-	sub, err := b.JS.PullSubscribe(b.Config.Subject, b.Config.Consumer, nats.BindStream(b.Config.Stream), nats.ManualAck())
+	sub, err := b.subscription()
 	if err != nil {
 		return nil, err
 	}
-	defer sub.Unsubscribe()
-	messages, err := sub.Fetch(req.Limit, nats.MaxWait(b.Config.FetchWait))
+	wait := b.Config.FetchWait
+	if req.PollWait > 0 && req.PollWait < wait {
+		wait = req.PollWait
+	}
+	messages, err := sub.Fetch(req.Limit, nats.MaxWait(wait))
 	if errors.Is(err, nats.ErrTimeout) {
 		return nil, nil
 	}
@@ -175,6 +183,20 @@ func (b *JetStreamBackend) Reserve(ctx context.Context, req ReserveRequest) ([]D
 	}
 	return deliveries, nil
 }
+
+func (b *JetStreamBackend) subscription() (*nats.Subscription, error) {
+	b.subMu.Lock()
+	defer b.subMu.Unlock()
+	if b.sub != nil && b.sub.IsValid() {
+		return b.sub, nil
+	}
+	sub, err := b.JS.PullSubscribe(b.Config.Subject, b.Config.Consumer, nats.BindStream(b.Config.Stream), nats.ManualAck())
+	if err != nil {
+		return nil, err
+	}
+	b.sub = sub
+	return sub, nil
+}
 func (b *JetStreamBackend) Ack(ctx context.Context, delivery Delivery) error {
 	err := b.Store.CompleteSuccess(ctx, delivery.Execution, delivery.Owner)
 	if err != nil && !errors.Is(err, store.ErrLeaseLost) {
@@ -216,4 +238,14 @@ func (b *JetStreamBackend) Depth(ctx context.Context, queue uuid.UUID) (QueueSta
 	return QueueStats{Queued: stats.Queued, Running: stats.Running, Retry: stats.Retry, Oldest: stats.Oldest}, err
 }
 func (b *JetStreamBackend) Health(ctx context.Context) error { return b.Conn.FlushWithContext(ctx) }
-func (b *JetStreamBackend) Close() error                     { b.Conn.Drain(); b.Conn.Close(); return nil }
+func (b *JetStreamBackend) Close() error {
+	b.subMu.Lock()
+	if b.sub != nil {
+		_ = b.sub.Unsubscribe()
+		b.sub = nil
+	}
+	b.subMu.Unlock()
+	b.Conn.Drain()
+	b.Conn.Close()
+	return nil
+}

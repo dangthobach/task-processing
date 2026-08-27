@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/example/task-processing/internal/domain/job"
@@ -31,8 +32,8 @@ type RedisStreamsBackend struct {
 	Client redis.UniversalClient
 	Config RedisStreamsConfig
 
-	groupOnce sync.Once
-	groupErr  error
+	groupMu    sync.Mutex
+	groupReady atomic.Bool
 }
 
 func NewRedisStreams(s *store.Store, cfg RedisStreamsConfig) (*RedisStreamsBackend, error) {
@@ -57,13 +58,20 @@ func (b *RedisStreamsBackend) Capabilities() Capabilities {
 	return Capabilities{NativePriority: false, NativeDelay: false, NativeDLQ: false, NativePause: false, AtomicBatch: false, ConsumerGroups: true}
 }
 func (b *RedisStreamsBackend) ensureGroup(ctx context.Context) error {
-	b.groupOnce.Do(func() {
-		err := b.Client.XGroupCreateMkStream(ctx, b.Config.Stream, b.Config.Group, "0").Err()
-		if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
-			b.groupErr = err
-		}
-	})
-	return b.groupErr
+	if b.groupReady.Load() {
+		return nil
+	}
+	b.groupMu.Lock()
+	defer b.groupMu.Unlock()
+	if b.groupReady.Load() {
+		return nil
+	}
+	err := b.Client.XGroupCreateMkStream(ctx, b.Config.Stream, b.Config.Group, "0").Err()
+	if err != nil && !strings.Contains(err.Error(), "BUSYGROUP") {
+		return err
+	}
+	b.groupReady.Store(true)
+	return nil
 }
 func (b *RedisStreamsBackend) Enqueue(ctx context.Context, message Message) error {
 	if err := message.Validate(); err != nil {
@@ -118,7 +126,11 @@ func (b *RedisStreamsBackend) Reserve(ctx context.Context, req ReserveRequest) (
 		return nil, err
 	}
 	if len(messages) == 0 {
-		streams, readErr := b.Client.XReadGroup(ctx, &redis.XReadGroupArgs{Group: b.Config.Group, Consumer: req.Owner, Streams: []string{b.Config.Stream, ">"}, Count: int64(req.Limit), Block: b.Config.Block}).Result()
+		block := b.Config.Block
+		if req.PollWait > 0 && req.PollWait < block {
+			block = req.PollWait
+		}
+		streams, readErr := b.Client.XReadGroup(ctx, &redis.XReadGroupArgs{Group: b.Config.Group, Consumer: req.Owner, Streams: []string{b.Config.Stream, ">"}, Count: int64(req.Limit), Block: block}).Result()
 		if errors.Is(readErr, redis.Nil) {
 			return nil, nil
 		}

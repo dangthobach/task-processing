@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"github.com/example/task-processing/internal/domain/job"
 	"github.com/example/task-processing/internal/security/kms"
+	"github.com/example/task-processing/internal/telemetry"
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -65,6 +66,7 @@ type Submit struct {
 	Priority                *job.Priority
 	ScheduleID              *uuid.UUID
 	ScheduledFor            *time.Time
+	TraceParent, TraceState string
 	// Snapshot is used by immutable workflow runtime nodes. It carries the
 	// execution values captured at workflow start instead of re-reading a
 	// mutable retry policy or job definition at downstream dispatch time.
@@ -72,6 +74,13 @@ type Submit struct {
 }
 
 func (s *Store) Submit(ctx context.Context, input Submit) (job.Run, error) {
+	if input.TraceParent == "" {
+		traceContext := telemetry.CaptureTraceContext(ctx)
+		input.TraceParent, input.TraceState = traceContext.TraceParent, traceContext.TraceState
+	} else {
+		traceContext := telemetry.ValidateTraceContext(telemetry.TraceContext{TraceParent: input.TraceParent, TraceState: input.TraceState})
+		input.TraceParent, input.TraceState = traceContext.TraceParent, traceContext.TraceState
+	}
 	d := Definition{}
 	var err error
 	if input.Snapshot != nil {
@@ -133,8 +142,8 @@ func (s *Store) Submit(ctx context.Context, input Submit) (job.Run, error) {
 	return job.Run{ID: run.ID, ProjectID: input.ProjectID, DefinitionID: d.ID, QueueID: d.QueueID, Status: job.EnqueuePending, Priority: priority, Payload: payload, Policy: d.Policy, FunctionKey: d.FunctionKey, FunctionVersion: d.FunctionVersion, IdempotencyKey: input.IdempotencyKey, DispatchID: run.DispatchID}, nil
 }
 
-const insertRunSQL = `INSERT INTO job_runs(id,project_id,job_definition_id,queue_id,schedule_id,idempotency_key,status,priority,scheduled_for,payload,payload_ciphertext,encryption_key_ref,function_version,policy_snapshot,current_dispatch_id)
-VALUES($1,$2,$3,$4,$5,NULLIF($6,''),'ENQUEUE_PENDING',$7,$8,$9,$10,NULLIF($11,''),$12,$13,$14)`
+const insertRunSQL = `INSERT INTO job_runs(id,project_id,job_definition_id,queue_id,schedule_id,idempotency_key,status,priority,scheduled_for,payload,payload_ciphertext,encryption_key_ref,function_version,policy_snapshot,current_dispatch_id,traceparent,tracestate)
+VALUES($1,$2,$3,$4,$5,NULLIF($6,''),'ENQUEUE_PENDING',$7,$8,$9,$10,NULLIF($11,''),$12,$13,$14,NULLIF($15,''),NULLIF($16,''))`
 
 // insertIdempotentRun deliberately uses separate INSERT and SELECT commands.
 // At READ COMMITTED PostgreSQL assigns a fresh snapshot to the second command,
@@ -156,14 +165,14 @@ func insertIdempotentRun(ctx context.Context, tx pgx.Tx, input Submit, definitio
 	}
 	var run job.Run
 	run.DispatchID = uuid.New()
-	err := tx.QueryRow(ctx, insertRunSQL+" RETURNING id,status,current_dispatch_id", uuid.New(), input.ProjectID, definition.ID, definition.QueueID, nil, "", priority, nil, payload, ciphertext, keyRef, definition.FunctionVersion, policy, run.DispatchID).Scan(&run.ID, &run.Status, &run.DispatchID)
+	err := tx.QueryRow(ctx, insertRunSQL+" RETURNING id,status,current_dispatch_id", uuid.New(), input.ProjectID, definition.ID, definition.QueueID, nil, "", priority, nil, payload, ciphertext, keyRef, definition.FunctionVersion, policy, run.DispatchID, input.TraceParent, input.TraceState).Scan(&run.ID, &run.Status, &run.DispatchID)
 	return run, err == nil, err
 }
 
 func insertByIdempotencyKey(ctx context.Context, tx pgx.Tx, input Submit, definition Definition, priority job.Priority, payload json.RawMessage, ciphertext []byte, keyRef string, policy []byte) (job.Run, bool, error) {
 	var run job.Run
 	run.DispatchID = uuid.New()
-	err := tx.QueryRow(ctx, insertRunSQL+" ON CONFLICT (project_id,idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id,status,current_dispatch_id", uuid.New(), input.ProjectID, definition.ID, definition.QueueID, nil, input.IdempotencyKey, priority, nil, payload, ciphertext, keyRef, definition.FunctionVersion, policy, run.DispatchID).Scan(&run.ID, &run.Status, &run.DispatchID)
+	err := tx.QueryRow(ctx, insertRunSQL+" ON CONFLICT (project_id,idempotency_key) WHERE idempotency_key IS NOT NULL DO NOTHING RETURNING id,status,current_dispatch_id", uuid.New(), input.ProjectID, definition.ID, definition.QueueID, nil, input.IdempotencyKey, priority, nil, payload, ciphertext, keyRef, definition.FunctionVersion, policy, run.DispatchID, input.TraceParent, input.TraceState).Scan(&run.ID, &run.Status, &run.DispatchID)
 	if err == nil {
 		return run, true, nil
 	}
@@ -176,7 +185,7 @@ func insertByIdempotencyKey(ctx context.Context, tx pgx.Tx, input Submit, defini
 func insertOccurrence(ctx context.Context, tx pgx.Tx, input Submit, definition Definition, priority job.Priority, payload json.RawMessage, ciphertext []byte, keyRef string, policy []byte) (job.Run, bool, error) {
 	var run job.Run
 	run.DispatchID = uuid.New()
-	err := tx.QueryRow(ctx, insertRunSQL+" ON CONFLICT (schedule_id,scheduled_for) WHERE schedule_id IS NOT NULL DO NOTHING RETURNING id,status,current_dispatch_id", uuid.New(), input.ProjectID, definition.ID, definition.QueueID, input.ScheduleID, "", priority, input.ScheduledFor, payload, ciphertext, keyRef, definition.FunctionVersion, policy, run.DispatchID).Scan(&run.ID, &run.Status, &run.DispatchID)
+	err := tx.QueryRow(ctx, insertRunSQL+" ON CONFLICT (schedule_id,scheduled_for) WHERE schedule_id IS NOT NULL DO NOTHING RETURNING id,status,current_dispatch_id", uuid.New(), input.ProjectID, definition.ID, definition.QueueID, input.ScheduleID, "", priority, input.ScheduledFor, payload, ciphertext, keyRef, definition.FunctionVersion, policy, run.DispatchID, input.TraceParent, input.TraceState).Scan(&run.ID, &run.Status, &run.DispatchID)
 	if err == nil {
 		return run, true, nil
 	}
@@ -240,6 +249,13 @@ func (s *Store) SubmitBulk(ctx context.Context, inputs []Submit) ([]job.Run, err
 		if in.ProjectID != first.ProjectID || in.DefinitionID != first.DefinitionID {
 			return nil, fmt.Errorf("bulk must target one project and job definition")
 		}
+		if in.TraceParent == "" {
+			traceContext := telemetry.CaptureTraceContext(ctx)
+			in.TraceParent, in.TraceState = traceContext.TraceParent, traceContext.TraceState
+		} else {
+			traceContext := telemetry.ValidateTraceContext(telemetry.TraceContext{TraceParent: in.TraceParent, TraceState: in.TraceState})
+			in.TraceParent, in.TraceState = traceContext.TraceParent, traceContext.TraceState
+		}
 		priority := d.Priority
 		if in.Priority != nil {
 			priority = *in.Priority
@@ -257,7 +273,7 @@ func (s *Store) SubmitBulk(ctx context.Context, inputs []Submit) ([]job.Run, err
 			return nil, sealErr
 		}
 		dispatchID := uuid.New()
-		_, err = tx.Exec(ctx, `INSERT INTO job_runs(id,project_id,job_definition_id,queue_id,idempotency_key,status,priority,payload,payload_ciphertext,encryption_key_ref,function_version,policy_snapshot,current_dispatch_id) VALUES($1,$2,$3,$4,NULLIF($5,''),'ENQUEUE_PENDING',$6,$7,$8,$9,NULLIF($10,''),$11,$12,$13)`, id, in.ProjectID, d.ID, d.QueueID, in.IdempotencyKey, priority, storedPayload, ciphertext, keyRef, d.FunctionVersion, policy, dispatchID)
+		_, err = tx.Exec(ctx, `INSERT INTO job_runs(id,project_id,job_definition_id,queue_id,idempotency_key,status,priority,payload,payload_ciphertext,encryption_key_ref,function_version,policy_snapshot,current_dispatch_id,traceparent,tracestate) VALUES($1,$2,$3,$4,NULLIF($5,''),'ENQUEUE_PENDING',$6,$7,$8,$9,NULLIF($10,''),$11,$12,$13,NULLIF($14,''),NULLIF($15,''))`, id, in.ProjectID, d.ID, d.QueueID, in.IdempotencyKey, priority, storedPayload, ciphertext, keyRef, d.FunctionVersion, policy, dispatchID, in.TraceParent, in.TraceState)
 		if err != nil {
 			return nil, err
 		}

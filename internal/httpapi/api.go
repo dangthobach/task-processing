@@ -583,7 +583,7 @@ func (a *API) createJobDefinition(w http.ResponseWriter, r *http.Request) {
 		return a.auditChangeTx(ctx, tx, principal(r), req.ProjectID, "job_definition.create", "job_definition", id, nil, req)
 	})
 	if errors.Is(err, controlplane.ErrDependencyNotFound) {
-		problem(w, r, 404, "DEPENDENCY_NOT_FOUND", "Function, queue or retry policy is outside this project, inactive, or the selected queue cannot run BATCH externally", false)
+		problem(w, r, 404, "DEPENDENCY_NOT_FOUND", "Function, queue or retry policy is outside this project, inactive, incompatible with the selected backend, or has no live compatible worker", false)
 		return
 	}
 	if err != nil {
@@ -1127,11 +1127,14 @@ func (a *API) createSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		ProjectID       uuid.UUID `json:"project_id"`
-		JobDefinitionID uuid.UUID `json:"job_definition_id"`
-		Cron            string    `json:"cron_expression"`
-		Timezone        string    `json:"timezone"`
-		WithSeconds     bool      `json:"with_seconds"`
+		ProjectID       uuid.UUID  `json:"project_id"`
+		JobDefinitionID uuid.UUID  `json:"job_definition_id"`
+		Type            string     `json:"schedule_type"`
+		Cron            string     `json:"cron_expression"`
+		Timezone        string     `json:"timezone"`
+		WithSeconds     bool       `json:"with_seconds"`
+		RunAt           *time.Time `json:"run_at"`
+		MisfirePolicy   string     `json:"misfire_policy"`
 	}
 	if !decode(w, r, &req) {
 		return
@@ -1140,7 +1143,7 @@ func (a *API) createSchedule(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 404, "PROJECT_NOT_FOUND", "Project not found", false)
 		return
 	}
-	id, err := a.business().Schedules.Create(r.Context(), tasks.ScheduleInput{ProjectID: req.ProjectID, DefinitionID: req.JobDefinitionID, Cron: req.Cron, Timezone: req.Timezone, WithSeconds: req.WithSeconds})
+	id, err := a.business().Schedules.Create(r.Context(), tasks.ScheduleInput{ProjectID: req.ProjectID, DefinitionID: req.JobDefinitionID, Type: req.Type, Cron: req.Cron, Timezone: req.Timezone, WithSeconds: req.WithSeconds, RunAt: req.RunAt, MisfirePolicy: req.MisfirePolicy})
 	if errors.Is(err, pgx.ErrNoRows) {
 		problem(w, r, 404, "JOB_DEFINITION_NOT_FOUND", "Job definition not found", false)
 		return
