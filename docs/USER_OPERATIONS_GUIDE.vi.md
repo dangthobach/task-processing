@@ -234,6 +234,9 @@ Nếu run kẹt `ENQUEUE_PENDING`, kiểm tra worker đang chạy và `task_outb
 - **Input JSON Schema** là schema JSON Schema của payload. Nhấn Register function chỉ khi JSON hợp lệ; API vẫn validate schema khi submit để không thể bypass UI.
 - **Schedule job** có `Preview next 5`. Kết quả được backend tính bằng cùng parser với Schedule Planner. Bật `Six-field cron` nếu biểu thức có giây.
 - **Workflow DAG designer**: thêm step, gán Job Definition cho từng step, sau đó `Connect steps`. Step key phải duy nhất. Backend kiểm tra node thiếu, self-edge và cycle trước khi ghi transaction.
+- **Workflow operations**: chọn Workflow để xem từng run và trạng thái từng node. `Cancel safely` chỉ hủy tại ranh giới giữa các node: các node/job chưa chạy và dispatch signal bị hủy cùng transaction. Nếu node đang `RUNNING`, UI trả `WORKFLOW_RUN_ACTIVE`; chờ handler kết thúc rồi refresh/thử lại, không có thao tác nào cắt ngang handler đang chạy.
+- Với run `FAILED`, `CANCELLED` hoặc `AWAITING_INTERVENTION`, dùng **Retry workflow**. Hệ thống tạo một run con mới (không sửa lịch sử run cũ), giữ nguyên node/graph snapshot của run nguồn. Nhấn lại sau timeout sẽ trả cùng run con thay vì tạo execution trùng lặp.
+- Khi tạo workflow, chọn **Failure policy**: `Fail fast` dừng các nhánh chưa dispatch; `Continue` cho phép các cạnh `On failure`; `Manual intervention` chuyển run sang `AWAITING_INTERVENTION` và chặn các node đang chờ. Mỗi cạnh có `On success`, `On failure`, hoặc `Always`; mọi cạnh đi vào một step phải thỏa, cạnh không thỏa sẽ làm step `SKIPPED`. Condition expression và compensation chưa được mở để không suy diễn kết quả handler không tồn tại trong runtime contract.
 
 ## Retention, audit và SLO
 

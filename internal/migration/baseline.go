@@ -49,6 +49,12 @@ var baselineRequirements = []baselineRequirement{
 	{introduced: 27, table: "platform_audit_logs", column: "resource_type"}, {introduced: 27, index: "ix_platform_audit_tenant_created"},
 	{introduced: 28, index: "ux_queue_backends_active_name"},
 	{introduced: 29, table: "platform_audit_outbox_events", column: "claim_token"}, {introduced: 29, index: "ix_platform_audit_outbox_claimable"},
+	{introduced: 30, table: "retention_runs", column: "deleted_count"}, {introduced: 30, index: "ix_retention_runs_project_created"},
+	{introduced: 31, table: "workflow_runs", column: "row_version"}, {introduced: 31, index: "ix_workflow_runs_project_workflow_created"},
+	{introduced: 31, table: "workflow_runs", trigger: "trg_workflow_runs_version"},
+	{introduced: 32, table: "workflow_runs", column: "retry_of_run_id"}, {introduced: 32, index: "ux_workflow_runs_retry_source"},
+	{introduced: 33, table: "workflow_definitions", column: "failure_policy"}, {introduced: 33, table: "workflow_runs", column: "failure_policy_snapshot"},
+	{introduced: 33, table: "workflow_run_edges", column: "condition_type"}, {introduced: 33, table: "workflow_node_runs", constraint: "workflow_node_runs_status_check"},
 }
 
 // VerifyBaseline validates the minimum relational fingerprint for an existing

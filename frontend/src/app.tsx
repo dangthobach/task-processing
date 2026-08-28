@@ -662,6 +662,33 @@ function ControlPlanePage({ api, notify }: { api: Api; notify: (text: string) =>
                   <button onClick={() => void lifecycle('resume')}>Resume</button>
                 </>
               )}
+              {aggregate === 'retention-policies' && !selected.deleted_at && (
+                <>
+                  <button
+                    onClick={() =>
+                      void act(async () => {
+                        const preview = await api.previewRetention(selected.id);
+                        notify(`Preview: ${preview.candidates}${preview.capped ? '+' : ''} candidate rows`);
+                        return selected;
+                      }, 'Preview complete')
+                    }
+                  >
+                    Preview
+                  </button>
+                  <button
+                    className="secondary"
+                    onClick={() =>
+                      void act(async () => {
+                        const run = await api.executeRetention(selected.id);
+                        notify(`Retention deleted ${run.deleted_count} rows`);
+                        return selected;
+                      }, 'Retention executed')
+                    }
+                  >
+                    Run bounded cleanup
+                  </button>
+                </>
+              )}
             </div>
           </div>
         )}
@@ -1350,6 +1377,7 @@ function CreatePage({ api, notify }: { api: Api; notify: (text: string) => void 
       <section className="stack">
         <DefinitionForm api={api} notify={notify} />
         <WorkflowDesigner api={api} notify={notify} />
+        <WorkflowRunsPanel api={api} notify={notify} />
         <QueueForm api={api} notify={notify} />
         <RetryPolicyForm api={api} notify={notify} />
         <RateLimitPolicyForm api={api} notify={notify} />
@@ -1357,6 +1385,106 @@ function CreatePage({ api, notify }: { api: Api; notify: (text: string) => void 
         <ScheduleForm api={api} notify={notify} />
       </section>
     </div>
+  );
+}
+function WorkflowRunsPanel({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const workflows = useAsync(api.workflows, [api]);
+  const [workflowID, setWorkflowID] = useState('');
+  const runs = useAsync(
+    () => (workflowID ? api.workflowRuns(workflowID) : Promise.resolve({ items: [] })),
+    [api, workflowID],
+  );
+  const [selected, setSelected] = useState<{
+    id: string;
+    status: string;
+    version: number;
+    failure_policy: string;
+    nodes: Array<{ id: string; key: string; status: string; job_run_id?: string }>;
+  }>();
+  const cancel = async () => {
+    if (!selected) return;
+    try {
+      const result = await api.cancelWorkflowRun(selected.id, selected.version);
+      setSelected({ ...selected, status: result.status, version: result.version });
+      await runs.refresh();
+      notify('Workflow run cancelled before any handler started.');
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  const retry = async () => {
+    if (!selected) return;
+    try {
+      const result = await api.retryWorkflowRun(selected.id, selected.version);
+      await runs.refresh();
+      notify(
+        result.created
+          ? `Workflow retry started: ${short(result.id)}`
+          : `Workflow retry already exists: ${short(result.id)}`,
+      );
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  return (
+    <Panel
+      title="Workflow operations"
+      subtitle="Inspect durable run/node state; downstream nodes activate only after predecessors succeed."
+      action={<RefreshButton onClick={runs.refresh} />}
+    >
+      {' '}
+      <label>
+        <span>Workflow</span>
+        <select value={workflowID} onChange={(event) => setWorkflowID(event.target.value)}>
+          <option value="">Select workflow</option>
+          {(workflows.data || []).map((workflow) => (
+            <option key={workflow.id} value={workflow.id}>
+              {workflow.name}
+            </option>
+          ))}
+        </select>
+      </label>
+      <div className="mini-list">
+        {(runs.data?.items || []).map((run) => (
+          <button key={run.id} onClick={() => void api.workflowRun(run.id).then(setSelected)}>
+            <span>
+              <strong className="mono">{short(run.id)}</strong>
+              <small>{time(run.created_at)}</small>
+            </span>
+            <Badge value={run.status} />
+          </button>
+        ))}
+      </div>
+      {selected && (
+        <div className="checkbox-list">
+          <div className="status-block">
+            <Badge value={selected.status} />
+            <span className="muted">{selected.failure_policy}</span>
+            {(selected.status === 'PENDING' || selected.status === 'RUNNING') && (
+              <button type="button" className="danger" onClick={() => void cancel()}>
+                Cancel safely
+              </button>
+            )}
+            {(selected.status === 'FAILED' ||
+              selected.status === 'CANCELLED' ||
+              selected.status === 'AWAITING_INTERVENTION') && (
+              <button type="button" onClick={() => void retry()}>
+                Retry workflow
+              </button>
+            )}
+          </div>
+          {selected.nodes.map((node) => (
+            <div className="status-block" key={node.id}>
+              <Badge value={node.status} />
+              <span>
+                {node.key}
+                {node.job_run_id && ` · ${short(node.job_run_id)}`}
+              </span>
+            </div>
+          ))}
+        </div>
+      )}
+    </Panel>
   );
 }
 function RunComposer({ api, notify }: { api: Api; notify: (text: string) => void }) {
@@ -1725,7 +1853,6 @@ function RetentionPolicyForm({ api, notify }: { api: Api; notify: (text: string)
             <option>JOB_LOG</option>
             <option>SCHEDULER_LOG</option>
             <option>REALTIME_EVENT</option>
-            <option>AUDIT_LOG</option>
             <option>TERMINAL_RUN</option>
           </select>
         </label>
@@ -1876,9 +2003,12 @@ function ScheduleForm({ api, notify }: { api: Api; notify: (text: string) => voi
   );
 }
 type WorkflowStepDraft = { key: string; jobDefinitionId: string };
-type WorkflowEdgeDraft = { from: string; to: string };
+type WorkflowEdgeDraft = { from: string; to: string; conditionType: 'ON_SUCCESS' | 'ON_FAILURE' | 'ALWAYS' };
 function WorkflowDesigner({ api, notify }: { api: Api; notify: (text: string) => void }) {
   const [name, setName] = useState('');
+  const [failurePolicy, setFailurePolicy] = useState<'FAIL_FAST' | 'CONTINUE' | 'MANUAL_INTERVENTION'>(
+    'FAIL_FAST',
+  );
   const [steps, setSteps] = useState<WorkflowStepDraft[]>([{ key: 'step_1', jobDefinitionId: '' }]);
   const [edges, setEdges] = useState<WorkflowEdgeDraft[]>([]);
   const changeStep = (index: number, field: keyof WorkflowStepDraft, value: string) =>
@@ -1899,8 +2029,13 @@ function WorkflowDesigner({ api, notify }: { api: Api; notify: (text: string) =>
     try {
       await api.createWorkflow({
         name,
+        failure_policy: failurePolicy,
         nodes: steps.map((step) => ({ key: step.key, job_definition_id: step.jobDefinitionId })),
-        edges,
+        edges: edges.map((edge) => ({
+          from: edge.from,
+          to: edge.to,
+          condition_type: edge.conditionType,
+        })),
       });
       notify('Workflow DAG created');
     } catch (error) {
@@ -1914,6 +2049,17 @@ function WorkflowDesigner({ api, notify }: { api: Api; notify: (text: string) =>
     >
       <form className="form-stack" onSubmit={create}>
         <Field label="Workflow name" value={name} onChange={setName} required />
+        <label>
+          <span>Failure policy</span>
+          <select
+            value={failurePolicy}
+            onChange={(event) => setFailurePolicy(event.target.value as typeof failurePolicy)}
+          >
+            <option value="FAIL_FAST">Fail fast — cancel undispatched branches</option>
+            <option value="CONTINUE">Continue — run matching failure branches</option>
+            <option value="MANUAL_INTERVENTION">Manual intervention — stop at boundary</option>
+          </select>
+        </label>
         <div className="mini-list">
           {steps.map((step, index) => (
             <div key={index} className="form-stack">
@@ -1986,6 +2132,25 @@ function WorkflowDesigner({ api, notify }: { api: Api; notify: (text: string) =>
                     <option key={step.key}>{step.key}</option>
                   ))}
                 </select>
+                <select
+                  value={edge.conditionType}
+                  onChange={(event) =>
+                    setEdges((current) =>
+                      current.map((entry, i) =>
+                        i === index
+                          ? {
+                              ...entry,
+                              conditionType: event.target.value as WorkflowEdgeDraft['conditionType'],
+                            }
+                          : entry,
+                      ),
+                    )
+                  }
+                >
+                  <option value="ON_SUCCESS">On success</option>
+                  <option value="ON_FAILURE">On failure</option>
+                  <option value="ALWAYS">Always</option>
+                </select>
                 <button
                   type="button"
                   className="danger-button"
@@ -2001,7 +2166,12 @@ function WorkflowDesigner({ api, notify }: { api: Api; notify: (text: string) =>
           type="button"
           className="secondary"
           disabled={steps.length < 2}
-          onClick={() => setEdges((current) => [...current, { from: steps[0].key, to: steps[1].key }])}
+          onClick={() =>
+            setEdges((current) => [
+              ...current,
+              { from: steps[0].key, to: steps[1].key, conditionType: 'ON_SUCCESS' },
+            ])
+          }
         >
           <Plus size={14} />
           Connect steps

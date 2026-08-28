@@ -44,3 +44,22 @@ The workflow package validates topology deterministically and rejects cycles,
 duplicate nodes and dangling edges. Terminal state changes now write a durable
 workflow-dispatch outbox in the same transaction; reconciliation repairs a
 crash window and drains it, so downstream nodes do not become stuck.
+
+Workflow runs are versioned operational resources. `POST
+/api/v1/workflow-runs/{id}/cancel` requires `If-Match` and runs under a
+workflow-row fence. It cancels only at a node boundary: queued/pending work
+and its dispatch signal are invalidated atomically, while a currently running
+handler returns `409 WORKFLOW_RUN_ACTIVE` instead of being abandoned.
+
+`POST /api/v1/workflow-runs/{id}/retry` accepts a failed, cancelled, or
+manually-paused run and also requires `If-Match`. It creates one idempotent
+child run linked by `retry_of_run_id`, copying the source's immutable node and
+graph snapshot rather than rewriting its history or reading a later definition.
+
+Workflow definitions now choose a snapshot failure policy: `FAIL_FAST`
+cancels undispatched branches, `CONTINUE` evaluates failure edges, and
+`MANUAL_INTERVENTION` blocks pending nodes in `AWAITING_INTERVENTION`. Edges
+support `ON_SUCCESS`, `ON_FAILURE`, and `ALWAYS`. Every incoming edge must
+match (the established DAG join rule); a terminal node with a non-matching
+edge is recorded as `SKIPPED`. Expression predicates and compensation remain
+disabled until handlers have a durable output/compensation contract.

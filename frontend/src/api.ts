@@ -210,6 +210,23 @@ export function createApi(connection: Connection) {
         method: 'POST',
         body: JSON.stringify({ project_id: connection.projectId, ...(body as object) }),
       }),
+    previewRetention: (id: string) =>
+      call<{
+        policy_id: string;
+        resource_type: string;
+        retention_days: number;
+        candidates: number;
+        capped: boolean;
+      }>(`/api/v1/retention-policies/${id}/preview`),
+    executeRetention: (id: string, limit = 1000) =>
+      call<{ id: string; deleted_count: number }>(`/api/v1/retention-policies/${id}/execute`, {
+        method: 'POST',
+        body: JSON.stringify({ limit }),
+      }),
+    retentionRuns: () =>
+      call<{ items: Array<{ id: string; deleted_count: number; started_at: string; finished_at: string }> }>(
+        '/api/v1/retention-runs',
+      ),
     createFunction: (body: unknown) =>
       call('/api/v1/function-definitions', {
         method: 'POST',
@@ -240,6 +257,43 @@ export function createApi(connection: Connection) {
     workflows: () =>
       call<Array<{ id: string; name: string; status: string; version: number; created_at: string }>>(
         '/api/v1/workflows',
+      ),
+    workflowRuns: (id: string) =>
+      call<{
+        items: Array<{
+          id: string;
+          status: string;
+          version: number;
+          retry_of_run_id?: string;
+          failure_policy: string;
+          created_at: string;
+          finished_at?: string;
+        }>;
+      }>(`/api/v1/workflows/${id}/runs`),
+    workflowRun: (id: string) =>
+      call<{
+        id: string;
+        workflow_id: string;
+        status: string;
+        version: number;
+        retry_of_run_id?: string;
+        failure_policy: string;
+        created_at: string;
+        finished_at?: string;
+        nodes: Array<{ id: string; key: string; status: string; job_run_id?: string }>;
+      }>(`/api/v1/workflow-runs/${id}`),
+    cancelWorkflowRun: (id: string, version: number) =>
+      call<{ id: string; status: string; version: number }>(`/api/v1/workflow-runs/${id}/cancel`, {
+        method: 'POST',
+        headers: { 'If-Match': `"${version}"` },
+      }),
+    retryWorkflowRun: (id: string, version: number) =>
+      call<{ id: string; status: string; version: number; retry_of_run_id: string; created: boolean }>(
+        `/api/v1/workflow-runs/${id}/retry`,
+        {
+          method: 'POST',
+          headers: { 'If-Match': `"${version}"` },
+        },
       ),
     createWorkflow: (body: unknown) =>
       call<{ id: string; version: number }>('/api/v1/workflows', {
