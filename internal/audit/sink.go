@@ -18,8 +18,12 @@ import (
 // Event has a stable ID that downstream sinks use for idempotent ingestion.
 // Delivery is intentionally at-least-once, never best-effort fire-and-forget.
 type Event struct {
-	ID            uuid.UUID       `json:"id"`
-	ProjectID     uuid.UUID       `json:"project_id"`
+	ID uuid.UUID `json:"id"`
+	// Scope identifies which audit ownership model produced the event. Project
+	// events retain project_id; platform events carry tenant_id instead.
+	Scope         string          `json:"scope"`
+	ProjectID     *uuid.UUID      `json:"project_id,omitempty"`
+	TenantID      *uuid.UUID      `json:"tenant_id,omitempty"`
 	EventType     string          `json:"event_type"`
 	AggregateType string          `json:"aggregate_type"`
 	AggregateID   uuid.UUID       `json:"aggregate_id"`

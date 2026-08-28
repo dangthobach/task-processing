@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc -b && vite build",
+    "format": "npx --yes prettier@3.8.2 --write src",
+    "format:check": "npx --yes prettier@3.8.2 --check src",
     "preview": "vite preview"
   },
   "dependencies": {

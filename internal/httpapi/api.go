@@ -146,6 +146,10 @@ func (a *API) Router() http.Handler {
 		r.Get("/api/v1/events", a.streamEvents)
 		r.Post("/api/v1/queue-backends", a.createQueueBackend)
 		r.Get("/api/v1/queue-backends", a.listQueueBackends)
+		r.Get("/api/v1/queue-backends/{id}", a.getQueueBackend)
+		r.Patch("/api/v1/queue-backends/{id}", a.updateQueueBackend)
+		r.Delete("/api/v1/queue-backends/{id}", a.deleteQueueBackend)
+		r.Post("/api/v1/queue-backends/{id}/restore", a.restoreQueueBackend)
 		r.Post("/api/v1/retry-policies", a.createRetryPolicy)
 		r.Post("/api/v1/rate-limit-policies", a.createRateLimitPolicy)
 		r.Post("/api/v1/retention-policies", a.createRetentionPolicy)
@@ -182,12 +186,19 @@ func (a *API) Router() http.Handler {
 		r.Get("/api/v1/workers", a.workers)
 		r.Get("/api/v1/scheduler-logs", a.schedulerLogs)
 		r.Get("/api/v1/audit-logs", a.audits)
+		r.Get("/api/v1/platform-audit-logs", a.platformAudits)
 		r.Get("/api/v1/rbac/permissions", a.rbacPermissions)
 		r.Get("/api/v1/rbac/users", a.rbacUsers)
 		r.Post("/api/v1/rbac/users", a.createRBACUser)
+		r.Patch("/api/v1/rbac/users/{id}", a.updateRBACUser)
+		r.Delete("/api/v1/rbac/users/{id}", a.deleteRBACUser)
+		r.Post("/api/v1/rbac/users/{id}/restore", a.restoreRBACUser)
 		r.Put("/api/v1/rbac/users/{id}/roles", a.replaceUserRoles)
 		r.Get("/api/v1/rbac/roles", a.rbacRoles)
 		r.Post("/api/v1/rbac/roles", a.createRBACRole)
+		r.Patch("/api/v1/rbac/roles/{id}", a.updateRBACRole)
+		r.Delete("/api/v1/rbac/roles/{id}", a.deleteRBACRole)
+		r.Post("/api/v1/rbac/roles/{id}/restore", a.restoreRBACRole)
 		r.Put("/api/v1/rbac/roles/{id}/permissions", a.replaceRolePermissions)
 		r.Get("/api/v1/{aggregate}", a.controlList)
 		r.Get("/api/v1/{aggregate}/{id}", a.controlGet)
@@ -1002,7 +1013,7 @@ func (a *API) batchLogs(w http.ResponseWriter, r *http.Request) {
 // returned once accepted. Its plaintext only exists in this request and while
 // encrypting it with the configured KMS protector.
 func (a *API) createQueueBackend(w http.ResponseWriter, r *http.Request) {
-	if !requireRole(w, r, "admin") {
+	if !requirePlatformAdmin(w, r) {
 		return
 	}
 	var req struct {
@@ -1017,42 +1028,138 @@ func (a *API) createQueueBackend(w http.ResponseWriter, r *http.Request) {
 		problem(w, r, 400, "INVALID_QUEUE_BACKEND", "name, backend_type and JSON config are required", false)
 		return
 	}
-	backend, err := (controlplane.QueueBackendService{Store: a.Store}).Create(r.Context(), controlplane.CreateQueueBackend{Name: req.Name, BackendType: req.BackendType, Config: req.Config})
+	p := principal(r)
+	backend, err := (controlplane.QueueBackendService{Store: a.Store}).Create(r.Context(), controlplane.CreateQueueBackend{Name: req.Name, BackendType: req.BackendType, Config: req.Config}, func(ctx context.Context, tx pgx.Tx, id uuid.UUID, before, after json.RawMessage) error {
+		return a.platformAuditChangeTx(ctx, tx, p, "queue_backend.create", "queue_backend", id, before, after)
+	})
 	if err != nil {
 		problem(w, r, 400, "INVALID_QUEUE_BACKEND", err.Error(), false)
 		return
 	}
-	writeJSON(w, http.StatusCreated, map[string]any{"id": backend.ID, "name": backend.Name, "backend_type": backend.BackendType, "status": backend.Status, "version": backend.Version})
+	writeJSON(w, http.StatusCreated, backend)
 }
 
 func (a *API) listQueueBackends(w http.ResponseWriter, r *http.Request) {
-	if !requireRole(w, r, "admin") {
+	if !requirePlatformAdmin(w, r) {
 		return
 	}
-	rows, err := a.Store.Pool.Query(r.Context(), `SELECT id,name,backend_type,capabilities,status,row_version,created_at FROM queue_backends WHERE deleted_at IS NULL ORDER BY created_at DESC,id DESC`)
+	includeDeleted, _ := strconv.ParseBool(r.URL.Query().Get("include_deleted"))
+	items, err := (controlplane.QueueBackendService{Store: a.Store}).List(r.Context(), includeDeleted)
 	if err != nil {
 		handleErr(w, r, err)
 		return
 	}
-	defer rows.Close()
-	items := make([]map[string]any, 0)
-	for rows.Next() {
-		var id uuid.UUID
-		var name, kind, status string
-		var capabilities json.RawMessage
-		var version int64
-		var created time.Time
-		if err = rows.Scan(&id, &name, &kind, &capabilities, &status, &version, &created); err != nil {
-			handleErr(w, r, err)
-			return
-		}
-		items = append(items, map[string]any{"id": id, "name": name, "backend_type": kind, "capabilities": capabilities, "status": status, "version": version, "created_at": created})
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
+func (a *API) getQueueBackend(w http.ResponseWriter, r *http.Request) {
+	if !requirePlatformAdmin(w, r) {
+		return
 	}
-	if err = rows.Err(); err != nil {
+	id, ok := controlID(w, r)
+	if !ok {
+		return
+	}
+	includeDeleted, _ := strconv.ParseBool(r.URL.Query().Get("include_deleted"))
+	backend, err := (controlplane.QueueBackendService{Store: a.Store}).Get(r.Context(), id, includeDeleted)
+	if err != nil {
 		handleErr(w, r, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+	w.Header().Set("ETag", fmt.Sprintf("%q", fmt.Sprint(backend.Version)))
+	writeJSON(w, http.StatusOK, backend)
+}
+
+func (a *API) updateQueueBackend(w http.ResponseWriter, r *http.Request) {
+	if !requirePlatformAdmin(w, r) {
+		return
+	}
+	id, ok := controlID(w, r)
+	if !ok {
+		return
+	}
+	version, ok := ifMatch(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Name   *string          `json:"name"`
+		Status *string          `json:"status"`
+		Config *json.RawMessage `json:"config"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	p := principal(r)
+	backend, err := (controlplane.QueueBackendService{Store: a.Store}).Update(r.Context(), id, version, controlplane.UpdateQueueBackend{Name: req.Name, Status: req.Status, Config: req.Config}, func(ctx context.Context, tx pgx.Tx, id uuid.UUID, before, after json.RawMessage) error {
+		return a.platformAuditChangeTx(ctx, tx, p, "queue_backend.update", "queue_backend", id, before, after)
+	})
+	if err != nil {
+		queueBackendError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", fmt.Sprintf("%q", fmt.Sprint(backend.Version)))
+	writeJSON(w, http.StatusOK, backend)
+}
+func (a *API) deleteQueueBackend(w http.ResponseWriter, r *http.Request) {
+	if !requirePlatformAdmin(w, r) {
+		return
+	}
+	id, ok := controlID(w, r)
+	if !ok {
+		return
+	}
+	version, ok := ifMatch(w, r)
+	if !ok {
+		return
+	}
+	p := principal(r)
+	backend, err := (controlplane.QueueBackendService{Store: a.Store}).SoftDelete(r.Context(), id, version, p.Actor, func(ctx context.Context, tx pgx.Tx, id uuid.UUID, before, after json.RawMessage) error {
+		return a.platformAuditChangeTx(ctx, tx, p, "queue_backend.soft_delete", "queue_backend", id, before, after)
+	})
+	if err != nil {
+		queueBackendError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", fmt.Sprintf("%q", fmt.Sprint(backend.Version)))
+	writeJSON(w, http.StatusOK, backend)
+}
+func (a *API) restoreQueueBackend(w http.ResponseWriter, r *http.Request) {
+	if !requirePlatformAdmin(w, r) {
+		return
+	}
+	id, ok := controlID(w, r)
+	if !ok {
+		return
+	}
+	version, ok := ifMatch(w, r)
+	if !ok {
+		return
+	}
+	p := principal(r)
+	backend, err := (controlplane.QueueBackendService{Store: a.Store}).Restore(r.Context(), id, version, func(ctx context.Context, tx pgx.Tx, id uuid.UUID, before, after json.RawMessage) error {
+		return a.platformAuditChangeTx(ctx, tx, p, "queue_backend.restore", "queue_backend", id, before, after)
+	})
+	if err != nil {
+		queueBackendError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", fmt.Sprintf("%q", fmt.Sprint(backend.Version)))
+	writeJSON(w, http.StatusOK, backend)
+}
+func queueBackendError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, controlplane.ErrResourceNotFound):
+		problem(w, r, http.StatusNotFound, "NOT_FOUND", "Queue backend not found", false)
+	case errors.Is(err, controlplane.ErrOptimisticLock):
+		problem(w, r, http.StatusPreconditionFailed, "PRECONDITION_FAILED", "Queue backend changed or is not active", false)
+	case errors.Is(err, controlplane.ErrRestoreConflict):
+		problem(w, r, http.StatusConflict, "RESTORE_CONFLICT", "An active queue backend already uses this name", false)
+	case errors.Is(err, controlplane.ErrDependencyBlocked):
+		problem(w, r, http.StatusConflict, "DEPENDENCY_BLOCKED", "Queue backend is used by an active queue", false)
+	default:
+		problem(w, r, http.StatusBadRequest, "INVALID_QUEUE_BACKEND", err.Error(), false)
+	}
 }
 
 func (a *API) createQueue(w http.ResponseWriter, r *http.Request) {

@@ -128,6 +128,10 @@ func (w *Worker) Run(ctx context.Context) error {
 				telemetry.Metrics.MaintenanceFailures.WithLabelValues("audit_outbox").Inc()
 				w.Log.Error("audit outbox dispatch failed", "error", err)
 			}
+			if err := w.dispatchPlatformAuditOutbox(ctx); err != nil {
+				telemetry.Metrics.MaintenanceFailures.WithLabelValues("platform_audit_outbox").Inc()
+				w.Log.Error("platform audit outbox dispatch failed", "error", err)
+			}
 		case <-retryTicker.C:
 			if _, err := w.Store.PromoteRetries(ctx); err != nil {
 				telemetry.Metrics.MaintenanceFailures.WithLabelValues("retry_promotion").Inc()
@@ -237,7 +241,8 @@ func (w *Worker) dispatchAuditOutbox(ctx context.Context) error {
 		sink, _ = audit.FromEnv()
 	}
 	for _, item := range items {
-		event := audit.Event{ID: item.ID, ProjectID: item.ProjectID, EventType: item.EventType, AggregateType: item.AggregateType, AggregateID: item.AggregateID, Payload: item.Payload, CreatedAt: item.CreatedAt}
+		projectID := item.ProjectID
+		event := audit.Event{ID: item.ID, Scope: "PROJECT", ProjectID: &projectID, EventType: item.EventType, AggregateType: item.AggregateType, AggregateID: item.AggregateID, Payload: item.Payload, CreatedAt: item.CreatedAt}
 		if deliveryErr := sink.Publish(ctx, event); deliveryErr != nil {
 			telemetry.Metrics.AuditSinkFailures.Inc()
 			_ = w.Store.RecordAuditOutboxFailure(ctx, item, deliveryErr)
@@ -245,6 +250,32 @@ func (w *Worker) dispatchAuditOutbox(ctx context.Context) error {
 			continue
 		}
 		if err := w.Store.MarkAuditOutboxPublished(ctx, item); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (w *Worker) dispatchPlatformAuditOutbox(ctx context.Context) error {
+	items, err := w.Store.ClaimPlatformAuditOutbox(ctx, w.Owner, 100, w.Lease)
+	if err != nil {
+		return err
+	}
+	sink := w.AuditSink
+	if sink == nil {
+		sink, _ = audit.FromEnv()
+	}
+	for _, item := range items {
+		event := audit.Event{ID: item.ID, Scope: "PLATFORM", TenantID: item.TenantID, EventType: item.EventType, AggregateType: item.AggregateType, AggregateID: item.AggregateID, Payload: item.Payload, CreatedAt: item.CreatedAt}
+		if deliveryErr := sink.Publish(ctx, event); deliveryErr != nil {
+			telemetry.Metrics.AuditSinkFailures.Inc()
+			if recordErr := w.Store.RecordPlatformAuditOutboxFailure(ctx, item, deliveryErr); recordErr != nil {
+				return recordErr
+			}
+			w.Log.Warn("platform audit sink delivery failed", "audit_event_id", item.ID, "error", deliveryErr)
+			continue
+		}
+		if err = w.Store.MarkPlatformAuditOutboxPublished(ctx, item); err != nil {
 			return err
 		}
 	}

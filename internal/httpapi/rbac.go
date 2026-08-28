@@ -1,12 +1,16 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
-	"strings"
+	"strconv"
 
+	"github.com/example/task-processing/internal/application/controlplane"
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 )
 
 func requirePlatformAdmin(w http.ResponseWriter, r *http.Request) bool {
@@ -20,7 +24,6 @@ func requirePlatformAdmin(w http.ResponseWriter, r *http.Request) bool {
 	problem(w, r, http.StatusForbidden, "FORBIDDEN", "platform:admin is required", false)
 	return false
 }
-
 func (a *API) rbacPermissions(w http.ResponseWriter, r *http.Request) {
 	if !requirePlatformAdmin(w, r) {
 		return
@@ -41,34 +44,70 @@ func (a *API) rbacPermissions(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, map[string]any{"id": id, "permission_key": key, "description": description})
 	}
+	if err = rows.Err(); err != nil {
+		handleErr(w, r, err)
+		return
+	}
 	writeJSON(w, http.StatusOK, out)
 }
-func (a *API) rbacUsers(w http.ResponseWriter, r *http.Request) {
+func (a *API) platformAudits(w http.ResponseWriter, r *http.Request) {
 	if !requirePlatformAdmin(w, r) {
 		return
 	}
-	p := principal(r)
-	rows, err := a.Store.Pool.Query(r.Context(), "SELECT id,subject,email,display_name,status,row_version,deleted_at FROM users WHERE tenant_id=$1 ORDER BY created_at DESC", p.TenantID)
+	rows, err := a.Store.Pool.Query(r.Context(), `SELECT id,tenant_id,actor_id,action,resource_type,resource_id,before_data,after_data,request_id,trace_id,metadata,created_at
+		FROM platform_audit_logs WHERE tenant_id=$1 ORDER BY created_at DESC,id DESC LIMIT 200`, principal(r).TenantID)
 	if err != nil {
 		handleErr(w, r, err)
 		return
 	}
 	defer rows.Close()
-	out := []map[string]any{}
+	items := []map[string]any{}
 	for rows.Next() {
-		var id uuid.UUID
-		var subject, name, status string
-		var email *string
-		var version int64
-		var deleted any
-		if err = rows.Scan(&id, &subject, &email, &name, &status, &version, &deleted); err != nil {
+		var id, resourceID uuid.UUID
+		var tenant *uuid.UUID
+		var actor, action, typ string
+		var before, after, metadata json.RawMessage
+		var requestID, traceID *string
+		var created any
+		if err = rows.Scan(&id, &tenant, &actor, &action, &typ, &resourceID, &before, &after, &requestID, &traceID, &metadata, &created); err != nil {
 			handleErr(w, r, err)
 			return
 		}
-		out = append(out, map[string]any{"id": id, "subject": subject, "email": email, "display_name": name, "status": status, "version": version, "deleted_at": deleted})
+		items = append(items, map[string]any{"id": id, "tenant_id": tenant, "actor_id": actor, "action": action, "resource_type": typ, "resource_id": resourceID, "before_data": before, "after_data": after, "request_id": requestID, "trace_id": traceID, "metadata": metadata, "created_at": created})
 	}
-	writeJSON(w, 200, out)
+	if err = rows.Err(); err != nil {
+		handleErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
 }
+func rbacIncludeDeleted(r *http.Request) bool {
+	value, _ := strconv.ParseBool(r.URL.Query().Get("include_deleted"))
+	return value
+}
+func (a *API) rbacUsers(w http.ResponseWriter, r *http.Request) {
+	if !requirePlatformAdmin(w, r) {
+		return
+	}
+	items, err := (controlplane.RBACService{Store: a.Store}).ListUsers(r.Context(), principal(r).TenantID, rbacIncludeDeleted(r))
+	if err != nil {
+		handleErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+func (a *API) rbacRoles(w http.ResponseWriter, r *http.Request) {
+	if !requirePlatformAdmin(w, r) {
+		return
+	}
+	items, err := (controlplane.RBACService{Store: a.Store}).ListRoles(r.Context(), principal(r).TenantID, rbacIncludeDeleted(r))
+	if err != nil {
+		handleErr(w, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"items": items})
+}
+
 func (a *API) createRBACUser(w http.ResponseWriter, r *http.Request) {
 	if !requirePlatformAdmin(w, r) {
 		return
@@ -77,48 +116,18 @@ func (a *API) createRBACUser(w http.ResponseWriter, r *http.Request) {
 		Subject     string `json:"subject"`
 		Email       string `json:"email"`
 		DisplayName string `json:"display_name"`
+		Status      string `json:"status"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
-	req.Subject = strings.TrimSpace(req.Subject)
-	req.DisplayName = strings.TrimSpace(req.DisplayName)
-	if req.Subject == "" || req.DisplayName == "" {
-		problem(w, r, 400, "INVALID_USER", "subject and display_name are required", false)
-		return
-	}
-	var id uuid.UUID
-	err := a.Store.Pool.QueryRow(r.Context(), "INSERT INTO users(tenant_id,subject,email,display_name) VALUES($1,$2,NULLIF($3,''),$4) RETURNING id", principal(r).TenantID, req.Subject, req.Email, req.DisplayName).Scan(&id)
+	p := principal(r)
+	out, err := (controlplane.RBACService{Store: a.Store}).CreateUser(r.Context(), p.TenantID, controlplane.UserInput{Subject: req.Subject, Email: req.Email, DisplayName: req.DisplayName, Status: req.Status}, a.rbacAudit(r, "rbac.user.create", "user"))
 	if err != nil {
-		handleErr(w, r, err)
+		rbacError(w, r, err)
 		return
 	}
-	writeJSON(w, 201, map[string]any{"id": id})
-}
-func (a *API) rbacRoles(w http.ResponseWriter, r *http.Request) {
-	if !requirePlatformAdmin(w, r) {
-		return
-	}
-	rows, err := a.Store.Pool.Query(r.Context(), "SELECT r.id,r.role_key,r.display_name,r.description,r.status,r.row_version,COALESCE(jsonb_agg(p.permission_key) FILTER (WHERE p.id IS NOT NULL),'[]'::jsonb) FROM roles r LEFT JOIN role_permissions rp ON rp.role_id=r.id LEFT JOIN permissions p ON p.id=rp.permission_id WHERE r.tenant_id=$1 AND r.deleted_at IS NULL GROUP BY r.id ORDER BY r.role_key", principal(r).TenantID)
-	if err != nil {
-		handleErr(w, r, err)
-		return
-	}
-	defer rows.Close()
-	out := []map[string]any{}
-	for rows.Next() {
-		var id uuid.UUID
-		var key, name, status string
-		var description *string
-		var version int64
-		var permissions json.RawMessage
-		if err = rows.Scan(&id, &key, &name, &description, &status, &version, &permissions); err != nil {
-			handleErr(w, r, err)
-			return
-		}
-		out = append(out, map[string]any{"id": id, "role_key": key, "display_name": name, "description": description, "status": status, "version": version, "permissions": permissions})
-	}
-	writeJSON(w, 200, out)
+	writeJSON(w, http.StatusCreated, out)
 }
 func (a *API) createRBACRole(w http.ResponseWriter, r *http.Request) {
 	if !requirePlatformAdmin(w, r) {
@@ -128,31 +137,89 @@ func (a *API) createRBACRole(w http.ResponseWriter, r *http.Request) {
 		Key         string `json:"role_key"`
 		Name        string `json:"display_name"`
 		Description string `json:"description"`
+		Status      string `json:"status"`
 	}
 	if !decode(w, r, &req) {
 		return
 	}
-	req.Key = strings.TrimSpace(req.Key)
-	req.Name = strings.TrimSpace(req.Name)
-	if req.Key == "" || req.Name == "" {
-		problem(w, r, 400, "INVALID_ROLE", "role_key and display_name are required", false)
-		return
-	}
-	var id uuid.UUID
-	err := a.Store.Pool.QueryRow(r.Context(), "INSERT INTO roles(tenant_id,role_key,display_name,description) VALUES($1,$2,$3,NULLIF($4,'')) RETURNING id", principal(r).TenantID, req.Key, req.Name, req.Description).Scan(&id)
+	p := principal(r)
+	out, err := (controlplane.RBACService{Store: a.Store}).CreateRole(r.Context(), p.TenantID, controlplane.RoleInput{RoleKey: req.Key, DisplayName: req.Name, Description: req.Description, Status: req.Status}, a.rbacAudit(r, "rbac.role.create", "role"))
 	if err != nil {
-		handleErr(w, r, err)
+		rbacError(w, r, err)
 		return
 	}
-	writeJSON(w, 201, map[string]any{"id": id})
+	writeJSON(w, http.StatusCreated, out)
+}
+func (a *API) updateRBACUser(w http.ResponseWriter, r *http.Request) {
+	if !requirePlatformAdmin(w, r) {
+		return
+	}
+	id, ok := rbacID(w, r)
+	if !ok {
+		return
+	}
+	version, ok := ifMatch(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Subject     *string `json:"subject"`
+		Email       *string `json:"email"`
+		DisplayName *string `json:"display_name"`
+		Status      *string `json:"status"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	p := principal(r)
+	out, err := (controlplane.RBACService{Store: a.Store}).UpdateUser(r.Context(), p.TenantID, id, version, controlplane.UserPatch{Subject: req.Subject, Email: req.Email, DisplayName: req.DisplayName, Status: req.Status}, a.rbacAudit(r, "rbac.user.update", "user"))
+	if err != nil {
+		rbacError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", quoteVersion(out))
+	writeJSON(w, http.StatusOK, out)
+}
+func (a *API) updateRBACRole(w http.ResponseWriter, r *http.Request) {
+	if !requirePlatformAdmin(w, r) {
+		return
+	}
+	id, ok := rbacID(w, r)
+	if !ok {
+		return
+	}
+	version, ok := ifMatch(w, r)
+	if !ok {
+		return
+	}
+	var req struct {
+		Key         *string `json:"role_key"`
+		Name        *string `json:"display_name"`
+		Description *string `json:"description"`
+		Status      *string `json:"status"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	p := principal(r)
+	out, err := (controlplane.RBACService{Store: a.Store}).UpdateRole(r.Context(), p.TenantID, id, version, controlplane.RolePatch{RoleKey: req.Key, DisplayName: req.Name, Description: req.Description, Status: req.Status}, a.rbacAudit(r, "rbac.role.update", "role"))
+	if err != nil {
+		rbacError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", quoteVersion(out))
+	writeJSON(w, http.StatusOK, out)
 }
 func (a *API) replaceRolePermissions(w http.ResponseWriter, r *http.Request) {
 	if !requirePlatformAdmin(w, r) {
 		return
 	}
-	role, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		problem(w, r, 400, "INVALID_ID", "Invalid role ID", false)
+	id, ok := rbacID(w, r)
+	if !ok {
+		return
+	}
+	version, ok := ifMatch(w, r)
+	if !ok {
 		return
 	}
 	var req struct {
@@ -161,41 +228,25 @@ func (a *API) replaceRolePermissions(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	tx, err := a.Store.Pool.Begin(r.Context())
+	p := principal(r)
+	out, err := (controlplane.RBACService{Store: a.Store}).ReplaceRolePermissions(r.Context(), p.TenantID, id, version, req.PermissionIDs, a.rbacAudit(r, "rbac.role.permissions.replace", "role"))
 	if err != nil {
-		handleErr(w, r, err)
+		rbacError(w, r, err)
 		return
 	}
-	defer tx.Rollback(r.Context())
-	var exists bool
-	if err = tx.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM roles WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL)", role, principal(r).TenantID).Scan(&exists); err != nil || !exists {
-		problem(w, r, 404, "NOT_FOUND", "Role not found", false)
-		return
-	}
-	if _, err = tx.Exec(r.Context(), "DELETE FROM role_permissions WHERE role_id=$1", role); err != nil {
-		handleErr(w, r, err)
-		return
-	}
-	for _, permission := range req.PermissionIDs {
-		tag, e := tx.Exec(r.Context(), "INSERT INTO role_permissions(role_id,permission_id) SELECT $1,id FROM permissions WHERE id=$2 ON CONFLICT DO NOTHING", role, permission)
-		if e != nil || tag.RowsAffected() == 0 {
-			problem(w, r, 400, "INVALID_PERMISSION", "Unknown permission", false)
-			return
-		}
-	}
-	if err = tx.Commit(r.Context()); err != nil {
-		handleErr(w, r, err)
-		return
-	}
-	writeJSON(w, 200, map[string]any{"id": role, "permission_ids": req.PermissionIDs})
+	w.Header().Set("ETag", quoteVersion(out))
+	writeJSON(w, http.StatusOK, out)
 }
 func (a *API) replaceUserRoles(w http.ResponseWriter, r *http.Request) {
 	if !requirePlatformAdmin(w, r) {
 		return
 	}
-	user, err := uuid.Parse(chi.URLParam(r, "id"))
-	if err != nil {
-		problem(w, r, 400, "INVALID_ID", "Invalid user ID", false)
+	id, ok := rbacID(w, r)
+	if !ok {
+		return
+	}
+	version, ok := ifMatch(w, r)
+	if !ok {
 		return
 	}
 	var req struct {
@@ -204,31 +255,131 @@ func (a *API) replaceUserRoles(w http.ResponseWriter, r *http.Request) {
 	if !decode(w, r, &req) {
 		return
 	}
-	tx, err := a.Store.Pool.Begin(r.Context())
+	p := principal(r)
+	out, err := (controlplane.RBACService{Store: a.Store}).ReplaceUserRoles(r.Context(), p.TenantID, id, version, req.RoleIDs, a.rbacAudit(r, "rbac.user.roles.replace", "user"))
 	if err != nil {
-		handleErr(w, r, err)
+		rbacError(w, r, err)
 		return
 	}
-	defer tx.Rollback(r.Context())
-	var exists bool
-	if err = tx.QueryRow(r.Context(), "SELECT EXISTS(SELECT 1 FROM users WHERE id=$1 AND tenant_id=$2 AND deleted_at IS NULL)", user, principal(r).TenantID).Scan(&exists); err != nil || !exists {
-		problem(w, r, 404, "NOT_FOUND", "User not found", false)
+	w.Header().Set("ETag", quoteVersion(out))
+	writeJSON(w, http.StatusOK, out)
+}
+func (a *API) deleteRBACUser(w http.ResponseWriter, r *http.Request) {
+	if !requirePlatformAdmin(w, r) {
 		return
 	}
-	if _, err = tx.Exec(r.Context(), "DELETE FROM user_roles WHERE user_id=$1", user); err != nil {
-		handleErr(w, r, err)
+	id, ok := rbacID(w, r)
+	if !ok {
 		return
 	}
-	for _, role := range req.RoleIDs {
-		tag, e := tx.Exec(r.Context(), "INSERT INTO user_roles(user_id,role_id) SELECT $1,id FROM roles WHERE id=$2 AND tenant_id=$3 AND deleted_at IS NULL ON CONFLICT DO NOTHING", user, role, principal(r).TenantID)
-		if e != nil || tag.RowsAffected() == 0 {
-			problem(w, r, 400, "INVALID_ROLE", "Unknown tenant role", false)
-			return
-		}
-	}
-	if err = tx.Commit(r.Context()); err != nil {
-		handleErr(w, r, err)
+	version, ok := ifMatch(w, r)
+	if !ok {
 		return
 	}
-	writeJSON(w, 200, map[string]any{"id": user, "role_ids": req.RoleIDs})
+	p := principal(r)
+	out, err := (controlplane.RBACService{Store: a.Store}).SoftDeleteUser(r.Context(), p.TenantID, id, version, p.Actor, a.rbacAudit(r, "rbac.user.soft_delete", "user"))
+	if err != nil {
+		rbacError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", quoteVersion(out))
+	writeJSON(w, http.StatusOK, out)
+}
+func (a *API) restoreRBACUser(w http.ResponseWriter, r *http.Request) {
+	if !requirePlatformAdmin(w, r) {
+		return
+	}
+	id, ok := rbacID(w, r)
+	if !ok {
+		return
+	}
+	version, ok := ifMatch(w, r)
+	if !ok {
+		return
+	}
+	p := principal(r)
+	out, err := (controlplane.RBACService{Store: a.Store}).RestoreUser(r.Context(), p.TenantID, id, version, a.rbacAudit(r, "rbac.user.restore", "user"))
+	if err != nil {
+		rbacError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", quoteVersion(out))
+	writeJSON(w, http.StatusOK, out)
+}
+func (a *API) deleteRBACRole(w http.ResponseWriter, r *http.Request) {
+	if !requirePlatformAdmin(w, r) {
+		return
+	}
+	id, ok := rbacID(w, r)
+	if !ok {
+		return
+	}
+	version, ok := ifMatch(w, r)
+	if !ok {
+		return
+	}
+	p := principal(r)
+	out, err := (controlplane.RBACService{Store: a.Store}).SoftDeleteRole(r.Context(), p.TenantID, id, version, p.Actor, a.rbacAudit(r, "rbac.role.soft_delete", "role"))
+	if err != nil {
+		rbacError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", quoteVersion(out))
+	writeJSON(w, http.StatusOK, out)
+}
+func (a *API) restoreRBACRole(w http.ResponseWriter, r *http.Request) {
+	if !requirePlatformAdmin(w, r) {
+		return
+	}
+	id, ok := rbacID(w, r)
+	if !ok {
+		return
+	}
+	version, ok := ifMatch(w, r)
+	if !ok {
+		return
+	}
+	p := principal(r)
+	out, err := (controlplane.RBACService{Store: a.Store}).RestoreRole(r.Context(), p.TenantID, id, version, a.rbacAudit(r, "rbac.role.restore", "role"))
+	if err != nil {
+		rbacError(w, r, err)
+		return
+	}
+	w.Header().Set("ETag", quoteVersion(out))
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *API) rbacAudit(r *http.Request, action, typ string) controlplane.RBACMutationAudit {
+	return func(ctx context.Context, tx pgx.Tx, id uuid.UUID, before, after json.RawMessage) error {
+		return a.platformAuditChangeTx(ctx, tx, principal(r), action, typ, id, before, after)
+	}
+}
+func rbacID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
+	id, err := uuid.Parse(chi.URLParam(r, "id"))
+	if err != nil {
+		problem(w, r, http.StatusBadRequest, "INVALID_ID", "Invalid RBAC ID", false)
+		return uuid.Nil, false
+	}
+	return id, true
+}
+func quoteVersion(raw json.RawMessage) string {
+	var v struct {
+		Version int64 `json:"version"`
+	}
+	_ = json.Unmarshal(raw, &v)
+	return `"` + strconv.FormatInt(v.Version, 10) + `"`
+}
+func rbacError(w http.ResponseWriter, r *http.Request, err error) {
+	switch {
+	case errors.Is(err, controlplane.ErrResourceNotFound):
+		problem(w, r, http.StatusNotFound, "NOT_FOUND", "RBAC resource not found", false)
+	case errors.Is(err, controlplane.ErrOptimisticLock):
+		problem(w, r, http.StatusPreconditionFailed, "PRECONDITION_FAILED", "RBAC resource changed or is not active", false)
+	case errors.Is(err, controlplane.ErrRestoreConflict):
+		problem(w, r, http.StatusConflict, "RESTORE_CONFLICT", "An active resource already uses this identity", false)
+	case errors.Is(err, controlplane.ErrDependencyBlocked):
+		problem(w, r, http.StatusConflict, "DEPENDENCY_BLOCKED", "RBAC resource is still in use", false)
+	default:
+		problem(w, r, http.StatusBadRequest, "INVALID_RBAC", err.Error(), false)
+	}
 }

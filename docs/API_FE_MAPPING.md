@@ -16,6 +16,9 @@ All JSON endpoints return the common envelope defined in `API_CONTRACT.md`.
 | `GET /api/v1/events` (SSE) | `events()` + `parseSse()` | Live events | protocol exception to JSON envelope |
 | `POST /api/v1/queues`, function/job definitions, schedules | `createQueue()`, `createFunction()`, `createDefinition()`, `createSchedule()` | Create workspace | project in body |
 | Queue/schedule state endpoints | `queueAction()`, `scheduleAction()` | no screen yet | requires version; backend list/detail endpoints are missing |
+| Queue Backend CRUD/restore | `queueBackends()`, `updateQueueBackend()`, `deleteQueueBackend()` | platform management | config is write-only; mutating calls require version |
+| RBAC users, roles, mappings | `rbacUsers()`, `rbacRoles()`, mapping replacement helpers | platform management | mapping calls require parent `If-Match` |
+| Platform audit log | `platformAudits()` | platform management | tenant-scoped, request/trace correlated |
 
 `/metrics` is intentionally not called by the React console: Prometheus uses its
 own text exposition format and should be scraped by Prometheus, not rendered as

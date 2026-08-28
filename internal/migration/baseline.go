@@ -46,6 +46,9 @@ var baselineRequirements = []baselineRequirement{
 	{introduced: 24, table: "job_definitions", trigger: "trg_job_definitions_require_worker_capability"},
 	{introduced: 25, table: "job_batches", column: "lease_token"}, {introduced: 25, index: "ix_job_batches_recovery_lease"},
 	{introduced: 26, table: "outbox_events", column: "expired_at"}, {introduced: 26, index: "ix_outbox_claimable_live"},
+	{introduced: 27, table: "platform_audit_logs", column: "resource_type"}, {introduced: 27, index: "ix_platform_audit_tenant_created"},
+	{introduced: 28, index: "ux_queue_backends_active_name"},
+	{introduced: 29, table: "platform_audit_outbox_events", column: "claim_token"}, {introduced: 29, index: "ix_platform_audit_outbox_claimable"},
 }
 
 // VerifyBaseline validates the minimum relational fingerprint for an existing

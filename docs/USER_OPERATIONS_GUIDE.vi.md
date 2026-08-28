@@ -239,7 +239,7 @@ Nếu run kẹt `ENQUEUE_PENDING`, kiểm tra worker đang chạy và `task_outb
 
 - Form **Retention & partitions** tạo policy theo resource. Sửa, disable, soft-delete hoặc restore ở Control Plane → Retention. Worker xóa theo chunk nên không giữ transaction lớn.
 - Alert rules ở `deploy/prometheus/task-processing-alerts.yml`; import `deploy/grafana/task-processing-dashboard.json` vào Grafana. SLO vận hành khuyến nghị: queue oldest age < 300s, heartbeat age < 30s và audit sink failures = 0 trong 15 phút.
-- Set `TASK_AUDIT_SINK_URL` (và tùy chọn `TASK_AUDIT_SINK_TOKEN`) trên worker để forward audit event. Sink nhận `X-Audit-Event-ID` và phải deduplicate theo ID; delivery là at-least-once với lease/backoff, tối đa 20 lần rồi expiry rõ ràng trong outbox.
+- Set `TASK_AUDIT_SINK_URL` (và tùy chọn `TASK_AUDIT_SINK_TOKEN`) trên worker để forward audit event. Sink nhận `X-Audit-Event-ID` và phải deduplicate theo ID; delivery là at-least-once với lease/backoff, tối đa 20 lần rồi expiry rõ ràng trong outbox. Audit cấp project có `scope: "PROJECT"` và `project_id`; audit RBAC/Queue Backend có `scope: "PLATFORM"` và `tenant_id`.
 
 ## Vault Transit và key rotation
 

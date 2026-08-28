@@ -19,6 +19,18 @@ type AuditOutboxEvent struct {
 	CreatedAt                  time.Time
 }
 
+// PlatformAuditOutboxEvent has tenant ownership instead of project ownership.
+// It must never be inserted into realtime_events because that stream is scoped
+// by project; it is exclusively an external audit-sink hand-off.
+type PlatformAuditOutboxEvent struct {
+	ID, PlatformAuditLogID, AggregateID uuid.UUID
+	TenantID                            *uuid.UUID
+	Token                               uuid.UUID
+	EventType, AggregateType            string
+	Payload                             json.RawMessage
+	CreatedAt                           time.Time
+}
+
 // setSystemAuditContext makes the active worker trace available to database
 // triggers for the lifetime of this transaction. It never creates a trace: a
 // null trace is correct for maintenance/recovery work with no parent request.
@@ -120,7 +132,7 @@ func (s *Store) MarkAuditOutboxPublished(ctx context.Context, item AuditOutboxEv
 		return err
 	}
 	defer tx.Rollback(ctx)
-	tag, err := tx.Exec(ctx, "UPDATE audit_outbox_events SET published_at=now(),attempts=attempts+1,last_error=NULL,claim_token=NULL,claimed_by=NULL,claim_expires_at=NULL WHERE id=$1 AND claim_token=$2 AND published_at IS NULL", item.ID, item.Token)
+	tag, err := tx.Exec(ctx, "UPDATE audit_outbox_events SET published_at=now(),attempts=attempts+1,last_error=NULL,claim_token=NULL,claimed_by=NULL,claim_expires_at=NULL WHERE id=$1 AND claim_token=$2 AND claim_expires_at>now() AND published_at IS NULL AND expired_at IS NULL", item.ID, item.Token)
 	if err != nil {
 		return err
 	}
@@ -136,12 +148,88 @@ func (s *Store) MarkAuditOutboxPublished(ctx context.Context, item AuditOutboxEv
 func (s *Store) RecordAuditOutboxFailure(ctx context.Context, item AuditOutboxEvent, cause error) error {
 	// Exponential retry is capped at five minutes. At 20 attempts the immutable
 	// audit_log remains available while this poison delivery is explicitly expired.
-	tag, err := s.Pool.Exec(ctx, `UPDATE audit_outbox_events SET attempts=attempts+1,last_error=$3,available_at=now()+make_interval(secs => LEAST(300, power(2,LEAST(attempts,8))::int)),claim_token=NULL,claimed_by=NULL,claim_expires_at=NULL,expired_at=CASE WHEN attempts+1>=20 THEN now() ELSE NULL END WHERE id=$1 AND claim_token=$2 AND published_at IS NULL`, item.ID, item.Token, truncateAuditError(cause))
+	tag, err := s.Pool.Exec(ctx, `UPDATE audit_outbox_events SET attempts=attempts+1,last_error=$3,available_at=now()+make_interval(secs => LEAST(300, power(2,LEAST(attempts,8))::int)),claim_token=NULL,claimed_by=NULL,claim_expires_at=NULL,expired_at=CASE WHEN attempts+1>=20 THEN now() ELSE NULL END WHERE id=$1 AND claim_token=$2 AND claim_expires_at>now() AND published_at IS NULL AND expired_at IS NULL`, item.ID, item.Token, truncateAuditError(cause))
 	if err != nil {
 		return err
 	}
 	if tag.RowsAffected() != 1 {
 		return fmt.Errorf("audit outbox lease lost")
+	}
+	return nil
+}
+
+// ClaimPlatformAuditOutbox obtains a short fenced lease and commits before any
+// external I/O. This keeps a slow SIEM or webhook from holding database locks.
+func (s *Store) ClaimPlatformAuditOutbox(ctx context.Context, owner string, limit int, lease time.Duration) ([]PlatformAuditOutboxEvent, error) {
+	if owner == "" {
+		return nil, fmt.Errorf("platform audit outbox claim owner is required")
+	}
+	if limit < 1 {
+		limit = 100
+	}
+	if lease < time.Second {
+		lease = time.Second
+	}
+	tx, err := s.Pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback(ctx)
+	rows, err := tx.Query(ctx, `WITH candidates AS (
+		SELECT id FROM platform_audit_outbox_events
+		WHERE published_at IS NULL AND expired_at IS NULL AND available_at<=now()
+		  AND (claim_expires_at IS NULL OR claim_expires_at<=now())
+		ORDER BY available_at,id FOR UPDATE SKIP LOCKED LIMIT $1
+	) UPDATE platform_audit_outbox_events e
+	SET claim_token=gen_random_uuid(),claimed_by=$2,claim_expires_at=now()+$3::interval
+	FROM candidates c WHERE e.id=c.id
+	RETURNING e.id,e.platform_audit_log_id,e.tenant_id,e.event_type,e.aggregate_type,e.aggregate_id,e.payload,e.claim_token,e.created_at`, limit, owner, lease.String())
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []PlatformAuditOutboxEvent{}
+	for rows.Next() {
+		var item PlatformAuditOutboxEvent
+		if err = rows.Scan(&item.ID, &item.PlatformAuditLogID, &item.TenantID, &item.EventType, &item.AggregateType, &item.AggregateID, &item.Payload, &item.Token, &item.CreatedAt); err != nil {
+			return nil, err
+		}
+		items = append(items, item)
+	}
+	if err = rows.Err(); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+func (s *Store) MarkPlatformAuditOutboxPublished(ctx context.Context, item PlatformAuditOutboxEvent) error {
+	tag, err := s.Pool.Exec(ctx, `UPDATE platform_audit_outbox_events
+		SET published_at=now(),attempts=attempts+1,last_error=NULL,claim_token=NULL,claimed_by=NULL,claim_expires_at=NULL
+		WHERE id=$1 AND claim_token=$2 AND claim_expires_at>now() AND published_at IS NULL AND expired_at IS NULL`, item.ID, item.Token)
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("platform audit outbox lease lost")
+	}
+	return nil
+}
+
+func (s *Store) RecordPlatformAuditOutboxFailure(ctx context.Context, item PlatformAuditOutboxEvent, cause error) error {
+	tag, err := s.Pool.Exec(ctx, `UPDATE platform_audit_outbox_events
+		SET attempts=attempts+1,last_error=$3,
+		available_at=now()+make_interval(secs => LEAST(300, power(2,LEAST(attempts,8))::int)),
+		claim_token=NULL,claimed_by=NULL,claim_expires_at=NULL,
+		expired_at=CASE WHEN attempts+1>=20 THEN now() ELSE NULL END
+		WHERE id=$1 AND claim_token=$2 AND claim_expires_at>now() AND published_at IS NULL AND expired_at IS NULL`, item.ID, item.Token, truncateAuditError(cause))
+	if err != nil {
+		return err
+	}
+	if tag.RowsAffected() != 1 {
+		return fmt.Errorf("platform audit outbox lease lost")
 	}
 	return nil
 }

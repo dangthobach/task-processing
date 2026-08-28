@@ -252,6 +252,40 @@ func (a *API) auditChangeTx(ctx context.Context, tx pgx.Tx, p Principal, project
 	return err
 }
 
+// platformAuditChangeTx is deliberately separate from auditChangeTx: RBAC and
+// queue-backend configuration are tenant/platform aggregates, not project
+// resources. Keeping this record in the same transaction prevents an audit
+// trail that claims a mutation which was rolled back (or vice versa).
+func (a *API) platformAuditChangeTx(ctx context.Context, tx pgx.Tx, p Principal, action, typ string, id uuid.UUID, before, after any) error {
+	beforeJSON, err := json.Marshal(before)
+	if err != nil {
+		return err
+	}
+	afterJSON, err := json.Marshal(after)
+	if err != nil {
+		return err
+	}
+	meta := requestMeta(ctx)
+	var auditID uuid.UUID
+	err = tx.QueryRow(ctx, `INSERT INTO platform_audit_logs(tenant_id,actor_id,action,resource_type,resource_id,before_data,after_data,request_id,trace_id,metadata)
+		VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) RETURNING id`, p.TenantID, p.Actor, action, typ, id, beforeJSON, afterJSON, meta.RequestID, meta.TraceID, json.RawMessage(`{"source":"api"}`)).Scan(&auditID)
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(map[string]any{
+		"audit_log_id": auditID, "tenant_id": p.TenantID, "actor_id": p.Actor,
+		"action": action, "resource_type": typ, "resource_id": id,
+		"before_data": json.RawMessage(beforeJSON), "after_data": json.RawMessage(afterJSON),
+		"request_id": meta.RequestID, "trace_id": meta.TraceID, "source": "api",
+	})
+	if err != nil {
+		return err
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO platform_audit_outbox_events(platform_audit_log_id,tenant_id,event_type,aggregate_type,aggregate_id,payload)
+		VALUES($1,$2,'audit.platform_change',$3,$4,$5)`, auditID, p.TenantID, typ, id, payload)
+	return err
+}
+
 func controlID(w http.ResponseWriter, r *http.Request) (uuid.UUID, bool) {
 	id, err := uuid.Parse(chi.URLParam(r, "id"))
 	if err != nil {

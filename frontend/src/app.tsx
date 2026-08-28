@@ -1,60 +1,2404 @@
-import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from 'react'
-import { Activity, Boxes, CalendarClock, CheckCircle2, ChevronRight, ClipboardList, Cog, Database, FileClock, Layers3, LoaderCircle, LogOut, Play, Plus, Radio, RefreshCw, RotateCcw, Rows3, Send, Settings2, ShieldCheck, SlidersHorizontal, TerminalSquare, Users, XCircle } from 'lucide-react'
-import { ApiError, Connection, createApi, parseSse } from './api'
-import type { Api, ControlAggregate, ControlRecord } from './api'
-import type { Attempt, Batch, BatchAttempt, BatchItem, BatchLog, Dlq, RealtimeEvent, Run } from './types'
+import { FormEvent, ReactNode, useCallback, useEffect, useMemo, useState } from 'react';
+import {
+  Activity,
+  Boxes,
+  CalendarClock,
+  CheckCircle2,
+  ChevronRight,
+  ClipboardList,
+  Cog,
+  Database,
+  FileClock,
+  Layers3,
+  LoaderCircle,
+  LogOut,
+  Play,
+  Plus,
+  Radio,
+  RefreshCw,
+  RotateCcw,
+  Rows3,
+  Send,
+  Settings2,
+  ShieldCheck,
+  SlidersHorizontal,
+  TerminalSquare,
+  Users,
+  XCircle,
+} from 'lucide-react';
+import { ApiError, Connection, createApi, parseSse } from './api';
+import type { Api, ControlAggregate, ControlRecord } from './api';
+import type {
+  Attempt,
+  Batch,
+  BatchAttempt,
+  BatchItem,
+  BatchLog,
+  Dlq,
+  PlatformAudit,
+  RealtimeEvent,
+  Run,
+} from './types';
 
-const defaultConnection:Connection = { baseUrl:'', actorId:'admin', tenantId:'', projectId:'', role:'admin' }
-const nav = [{id:'overview',label:'Overview',icon:Activity},{id:'runs',label:'Job runs',icon:Rows3},{id:'batches',label:'Batches',icon:Layers3},{id:'control',label:'Control plane',icon:Cog},{id:'operations',label:'Operations',icon:TerminalSquare},{id:'events',label:'Live events',icon:Radio},{id:'create',label:'Create',icon:Plus}]
-type Page = typeof nav[number]['id']
+const defaultConnection: Connection = {
+  baseUrl: '',
+  actorId: 'admin',
+  tenantId: '',
+  projectId: '',
+  role: 'admin',
+};
+const nav = [
+  { id: 'overview', label: 'Overview', icon: Activity },
+  { id: 'runs', label: 'Job runs', icon: Rows3 },
+  { id: 'batches', label: 'Batches', icon: Layers3 },
+  { id: 'control', label: 'Control plane', icon: Cog },
+  { id: 'operations', label: 'Operations', icon: TerminalSquare },
+  { id: 'platform', label: 'Platform admin', icon: Users },
+  { id: 'events', label: 'Live events', icon: Radio },
+  { id: 'create', label: 'Create', icon: Plus },
+];
+type Page = (typeof nav)[number]['id'];
 
-function useAsync<T>(load:()=>Promise<T>, deps:unknown[]){const [data,setData]=useState<T>();const [loading,setLoading]=useState(true);const [error,setError]=useState<string>();const refresh=useCallback(async()=>{setLoading(true);try{setData(await load());setError(undefined)}catch(e){setError(message(e))}finally{setLoading(false)}},deps);useEffect(()=>{void refresh()},[refresh]);return{data,loading,error,refresh}}
-const message=(error:unknown)=>error instanceof ApiError?`${error.code?`${error.code}: `:''}${error.message}`:error instanceof Error?error.message:'Đã xảy ra lỗi không xác định'
-const time=(value?:string)=>value?new Intl.DateTimeFormat('vi-VN',{dateStyle:'short',timeStyle:'medium'}).format(new Date(value)):'—'
-const short=(value:string)=>`${value.slice(0,8)}…${value.slice(-4)}`
-const percent=(done:number,total:number)=>total?Math.round(done*100/total):0
+function useAsync<T>(load: () => Promise<T>, deps: unknown[]) {
+  const [data, setData] = useState<T>();
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string>();
+  const refresh = useCallback(async () => {
+    setLoading(true);
+    try {
+      setData(await load());
+      setError(undefined);
+    } catch (e) {
+      setError(message(e));
+    } finally {
+      setLoading(false);
+    }
+  }, deps);
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+  return { data, loading, error, refresh };
+}
+const message = (error: unknown) =>
+  error instanceof ApiError
+    ? `${error.code ? `${error.code}: ` : ''}${error.message}`
+    : error instanceof Error
+      ? error.message
+      : 'Đã xảy ra lỗi không xác định';
+const time = (value?: string) =>
+  value
+    ? new Intl.DateTimeFormat('vi-VN', { dateStyle: 'short', timeStyle: 'medium' }).format(new Date(value))
+    : '—';
+const short = (value: string) => `${value.slice(0, 8)}…${value.slice(-4)}`;
+const percent = (done: number, total: number) => (total ? Math.round((done * 100) / total) : 0);
 
-export function App(){const [connection,setConnection]=useState<Connection>(()=>({...defaultConnection,...JSON.parse(localStorage.getItem('task-console.connection')||'{}')}));const [page,setPage]=useState<Page>('overview');const [showSettings,setShowSettings]=useState(!connection.tenantId||!connection.projectId);const [toast,setToast]=useState<string>();const api=useMemo(()=>createApi(connection),[connection]);const saveConnection=(next:Connection)=>{setConnection(next);localStorage.setItem('task-console.connection',JSON.stringify(next));setShowSettings(false)};const notify=(text:string)=>{setToast(text);window.setTimeout(()=>setToast(undefined),3500)};return <div className="app-shell"><aside className="sidebar"><div className="brand"><div className="brand-mark"><Boxes size={22}/></div><div><strong>Flowcraft</strong><span>Task control plane</span></div></div><nav>{nav.map(item=>{const Icon=item.icon;return <button className={page===item.id?'active':''} key={item.id} onClick={()=>setPage(item.id)}><Icon size={18}/><span>{item.label}</span>{page===item.id&&<ChevronRight size={16}/>}</button>})}</nav><div className="sidebar-footer"><div className="connection-state"><span className={connection.projectId?'dot online':'dot'}/><span>{connection.projectId?'Connected workspace':'Setup required'}</span></div><button onClick={()=>setShowSettings(true)}><Settings2 size={18}/><span>Connection</span></button></div></aside><main><header className="topbar"><div><p className="eyebrow">TASK PROCESSING PLATFORM</p><h1>{nav.find(item=>item.id===page)?.label}</h1></div><div className="topbar-actions"><button className="ghost" onClick={()=>setShowSettings(true)}><ShieldCheck size={17}/>{connection.role}</button><button className="primary" onClick={()=>setPage('create')}><Plus size={17}/>Create job</button></div></header><div className="content">{!connection.projectId?<EmptySetup open={()=>setShowSettings(true)}/>:<PageContent page={page} api={api} notify={notify}/>}</div></main>{showSettings&&<ConnectionSheet connection={connection} onClose={()=>setShowSettings(false)} onSave={saveConnection}/>} {toast&&<div className="toast"><CheckCircle2 size={17}/>{toast}</div>}</div>}
+export function App() {
+  const [connection, setConnection] = useState<Connection>(() => ({
+    ...defaultConnection,
+    ...JSON.parse(localStorage.getItem('task-console.connection') || '{}'),
+  }));
+  const [page, setPage] = useState<Page>('overview');
+  const [showSettings, setShowSettings] = useState(!connection.tenantId || !connection.projectId);
+  const [toast, setToast] = useState<string>();
+  const api = useMemo(() => createApi(connection), [connection]);
+  const saveConnection = (next: Connection) => {
+    setConnection(next);
+    localStorage.setItem('task-console.connection', JSON.stringify(next));
+    setShowSettings(false);
+  };
+  const notify = (text: string) => {
+    setToast(text);
+    window.setTimeout(() => setToast(undefined), 3500);
+  };
+  return (
+    <div className="app-shell">
+      <aside className="sidebar">
+        <div className="brand">
+          <div className="brand-mark">
+            <Boxes size={22} />
+          </div>
+          <div>
+            <strong>Flowcraft</strong>
+            <span>Task control plane</span>
+          </div>
+        </div>
+        <nav>
+          {nav.map((item) => {
+            const Icon = item.icon;
+            return (
+              <button
+                className={page === item.id ? 'active' : ''}
+                key={item.id}
+                onClick={() => setPage(item.id)}
+              >
+                <Icon size={18} />
+                <span>{item.label}</span>
+                {page === item.id && <ChevronRight size={16} />}
+              </button>
+            );
+          })}
+        </nav>
+        <div className="sidebar-footer">
+          <div className="connection-state">
+            <span className={connection.projectId ? 'dot online' : 'dot'} />
+            <span>{connection.projectId ? 'Connected workspace' : 'Setup required'}</span>
+          </div>
+          <button onClick={() => setShowSettings(true)}>
+            <Settings2 size={18} />
+            <span>Connection</span>
+          </button>
+        </div>
+      </aside>
+      <main>
+        <header className="topbar">
+          <div>
+            <p className="eyebrow">TASK PROCESSING PLATFORM</p>
+            <h1>{nav.find((item) => item.id === page)?.label}</h1>
+          </div>
+          <div className="topbar-actions">
+            <button className="ghost" onClick={() => setShowSettings(true)}>
+              <ShieldCheck size={17} />
+              {connection.role}
+            </button>
+            <button className="primary" onClick={() => setPage('create')}>
+              <Plus size={17} />
+              Create job
+            </button>
+          </div>
+        </header>
+        <div className="content">
+          {!(page === 'platform' ? connection.tenantId : connection.projectId) ? (
+            <EmptySetup open={() => setShowSettings(true)} />
+          ) : (
+            <PageContent page={page} api={api} notify={notify} />
+          )}
+        </div>
+      </main>
+      {showSettings && (
+        <ConnectionSheet
+          connection={connection}
+          onClose={() => setShowSettings(false)}
+          onSave={saveConnection}
+        />
+      )}{' '}
+      {toast && (
+        <div className="toast">
+          <CheckCircle2 size={17} />
+          {toast}
+        </div>
+      )}
+    </div>
+  );
+}
 
-function PageContent({page,api,notify}:{page:Page;api:Api;notify:(text:string)=>void}){switch(page){case'overview':return <Overview api={api}/>;case'runs':return <RunsPage api={api} notify={notify}/>;case'batches':return <BatchesPage api={api}/>;case'control':return <ControlPlanePage api={api} notify={notify}/>;case'operations':return <Operations api={api} notify={notify}/>;case'events':return <EventsPage api={api}/>;case'create':return <CreatePage api={api} notify={notify}/>}}
-function EmptySetup({open}:{open:()=>void}){return <section className="setup"><div className="setup-icon"><Database size={30}/></div><h2>Connect a workspace</h2><p>Nhập Tenant ID và Project ID để bắt đầu điều hành task platform qua API đã được scope an toàn.</p><button className="primary" onClick={open}>Configure connection <ChevronRight size={17}/></button></section>}
-function ConnectionSheet({connection,onClose,onSave}:{connection:Connection;onClose:()=>void;onSave:(value:Connection)=>void}){const [draft,setDraft]=useState(connection);const set=(key:keyof Connection,value:string)=>setDraft(current=>({...current,[key]:value}));return <div className="sheet-backdrop"><section className="sheet"><div className="sheet-head"><div><p className="eyebrow">DEVELOPMENT IDENTITY</p><h2>Connection settings</h2></div><button className="icon-button" onClick={onClose}><XCircle size={21}/></button></div><p className="muted">Backend hiện dùng header identity. Thay bằng OIDC khi deploy production.</p><div className="form-grid"><Field label="API base URL" value={draft.baseUrl} placeholder="Để trống khi dùng Vite proxy" onChange={v=>set('baseUrl',v)}/><Field label="Actor ID" value={draft.actorId} onChange={v=>set('actorId',v)}/><Field label="Tenant UUID" value={draft.tenantId} onChange={v=>set('tenantId',v)}/><Field label="Project UUID" value={draft.projectId} onChange={v=>set('projectId',v)}/><label><span>Role</span><select value={draft.role} onChange={e=>set('role',e.target.value)}>{['admin','operator','developer','viewer'].map(role=><option key={role}>{role}</option>)}</select></label></div><div className="sheet-actions"><button className="ghost" onClick={onClose}>Cancel</button><button className="primary" onClick={()=>onSave(draft)}>Save connection</button></div></section></div>}
-function Overview({api}:{api:Api}){const runs=useAsync(api.runs,[api]);const batches=useAsync(api.batches,[api]);const dlq=useAsync(api.dlq,[api]);const workers=useAsync(api.workers,[api]);const activeRuns=runs.data?.filter(run=>['RUNNING','QUEUED','RESERVED','RETRY_WAIT'].includes(run.status)).length||0;return <><section className="metric-grid"><Metric label="Active runs" value={activeRuns} icon={<Activity/>} tone="blue"/><Metric label="Queued batches" value={batches.data?.filter(batch=>['RESERVED','RUNNING'].includes(batch.status)).length||0} icon={<Layers3/>} tone="purple"/><Metric label="Open DLQ" value={dlq.data?.length||0} icon={<XCircle/>} tone="rose"/><Metric label="Workers online" value={workers.data?.filter(worker=>worker.status==='ONLINE').length||0} icon={<Users/>} tone="green"/></section><section className="grid-two"><Panel title="Recent job runs" action={<RefreshButton onClick={runs.refresh}/>}><RunsTable runs={(runs.data||[]).slice(0,6)} loading={runs.loading}/></Panel><Panel title="Batch health" action={<RefreshButton onClick={batches.refresh}/>}><BatchTable batches={(batches.data||[]).slice(0,6)} loading={batches.loading}/></Panel></section><section className="grid-two"><Panel title="Operational signal" subtitle="Thông tin được refetch từ source of truth."><div className="signal-list"><Signal icon={<ClipboardList/>} label="Accepted runs" value={runs.data?.length||0}/><Signal icon={<Layers3/>} label="Recent batches" value={batches.data?.length||0}/><Signal icon={<FileClock/>} label="DLQ requires review" value={dlq.data?.length||0} warn/></div></Panel><Panel title="Worker fleet"><WorkerList api={api}/></Panel></section></>}
-function RunsPage({api,notify}:{api:Api;notify:(text:string)=>void}){const resource=useAsync(api.runs,[api]);const [selected,setSelected]=useState<Run>();const act=async(action:()=>Promise<unknown>,success:string)=>{try{await action();notify(success);await resource.refresh()}catch(e){notify(message(e))}};return <><Panel title="Execution history" subtitle="Logical run state; open one row for attempt-level details." action={<RefreshButton onClick={resource.refresh}/>}><RunsTable runs={resource.data||[]} loading={resource.loading} onSelect={setSelected} actions={run=><div className="row-actions"><button onClick={event=>{event.stopPropagation();void act(()=>api.retry(run.id,run.version),'Run queued for retry')}} title="Retry"><RotateCcw size={16}/></button><button onClick={event=>{event.stopPropagation();void act(()=>api.cancel(run.id,run.version),'Run cancelled')}} title="Cancel"><XCircle size={16}/></button></div>}/></Panel>{selected&&<RunDrawer run={selected} api={api} onClose={()=>setSelected(undefined)}/>}</>}
-function BatchesPage({api}:{api:Api}){const resource=useAsync(api.batches,[api]);const [selected,setSelected]=useState<Batch>();return <><Panel title="Batch executions" subtitle="A batch is one handler invocation; each item keeps its own retry and DLQ lifecycle." action={<RefreshButton onClick={resource.refresh}/>}><BatchTable batches={resource.data||[]} loading={resource.loading} onSelect={setSelected}/></Panel>{selected&&<BatchDrawer batch={selected} api={api} onClose={()=>setSelected(undefined)}/>}</>}
-function Operations({api,notify}:{api:Api;notify:(text:string)=>void}){const dlq=useAsync(api.dlq,[api]);const workers=useAsync(api.workers,[api]);const logs=useAsync(api.schedulerLogs,[api]);const audits=useAsync(api.audits,[api]);const replay=async(id:string,version:number)=>{try{await api.replayDlq(id,version);notify('DLQ item queued for replay');await dlq.refresh()}catch(e){notify(message(e))}};return <div className="stack"><Panel title="Dead letter queue" subtitle="Only operators and administrators can replay a quarantined run." action={<RefreshButton onClick={dlq.refresh}/>}><DataTable headers={['Run','Reason','Entered','']}>{(dlq.data||[]).map(item=><tr key={item.id}><td className="mono">{short(item.job_run_id)}</td><td><Badge value={item.reason}/></td><td>{time(item.entered_at)}</td><td><button className="small-button" onClick={()=>void replay(item.id,item.version)}><RotateCcw size={14}/>Replay</button></td></tr>)}</DataTable></Panel><section className="grid-two"><Panel title="Worker fleet" action={<RefreshButton onClick={workers.refresh}/>}><WorkersTable workers={workers.data||[]}/></Panel><Panel title="Scheduler log" action={<RefreshButton onClick={logs.refresh}/>}><div className="log-list">{logs.data?.items.slice(0,8).map(log=><div className="log-line" key={log.id}><Badge value={log.level}/><div><strong>{log.event_type}</strong><span>{log.message}</span></div><time>{time(log.occurred_at)}</time></div>)||<EmptyRow label="No scheduler log yet"/>}</div></Panel></section><Panel title="Audit trail" action={<RefreshButton onClick={audits.refresh}/>}><DataTable headers={['Actor','Action','Resource','At']}>{(audits.data||[]).slice(0,10).map(entry=><tr key={entry.id}><td>{entry.actor_id}</td><td>{entry.action}</td><td><span className="mono">{entry.resource_type} · {short(entry.resource_id)}</span></td><td>{time(entry.created_at)}</td></tr>)}</DataTable></Panel></div>}
-const controlLabels:Record<ControlAggregate,string>={queues:'Queues','retry-policies':'Retry policies','rate-limit-policies':'Rate limits','retention-policies':'Retention','function-definitions':'Functions','job-definitions':'Job definitions',schedules:'Schedules'}
-function controlName(item:ControlRecord){return String(item.name||item.function_key||item.cron_expression||item.id)}
-function ControlPlanePage({api,notify}:{api:Api;notify:(text:string)=>void}){const [aggregate,setAggregate]=useState<ControlAggregate>('queues');const [includeDeleted,setIncludeDeleted]=useState(false);const resource=useAsync(()=>api.control(aggregate,includeDeleted),[api,aggregate,includeDeleted]);const [selected,setSelected]=useState<ControlRecord>();const [patch,setPatch]=useState('');useEffect(()=>{setSelected(undefined);setPatch('')},[aggregate,includeDeleted]);const act=async(work:()=>Promise<ControlRecord>,success:string)=>{try{const next=await work();setSelected(next);setPatch('');notify(success);await resource.refresh()}catch(error){notify(message(error))}};const lifecycle=async(action:'pause'|'resume'|'drain')=>{if(!selected)return;try{if(aggregate==='queues')await api.queueAction(selected.id,action,selected.version);if(aggregate==='schedules'&&action!=='drain')await api.scheduleAction(selected.id,action,selected.version);setSelected(current=>current?{...current,version:current.version+1}:current);notify('Lifecycle updated');await resource.refresh()}catch(error){notify(message(error))}};return <div className="grid-two"><Panel title="Control-plane registry" subtitle="All reads include current optimistic-lock version." action={<div className="row-actions"><label className="toggle"><input type="checkbox" checked={includeDeleted} onChange={event=>setIncludeDeleted(event.target.checked)}/>Deleted</label><RefreshButton onClick={resource.refresh}/></div>}><div className="segmented">{(Object.keys(controlLabels) as ControlAggregate[]).map(key=><button key={key} type="button" className={aggregate===key?'selected':''} onClick={()=>setAggregate(key)}>{controlLabels[key]}</button>)}</div><DataTable headers={['Resource','State','Version','']}>{resource.loading?<tr><td colSpan={4}><Loader/></td></tr>:(resource.data?.items||[]).map(item=><tr className="selectable" key={item.id} onClick={()=>{setSelected(item);setPatch('')}}><td><strong>{controlName(item)}</strong><br/><span className="mono">{short(item.id)}</span></td><td>{item.deleted_at?<Badge value="DELETED"/>:<Badge value={item.status||'ACTIVE'}/>}</td><td>v{item.version}</td><td><ChevronRight size={16}/></td></tr>)}</DataTable></Panel><Panel title={selected?controlLabels[aggregate]+' detail':'Select a resource'} subtitle={selected?'Patch only mutable fields. If another actor writes first, your request receives PRECONDITION_FAILED.':'Select an item to edit, soft-delete, restore or execute its lifecycle action.'}>{selected&&<div className="form-stack"><dl className="detail-grid"><dt>ID</dt><dd className="mono">{selected.id}</dd><dt>Version</dt><dd>{selected.version}</dd><dt>Deleted</dt><dd>{selected.deleted_at?time(selected.deleted_at):'No'}</dd></dl><label><span>JSON patch</span><textarea rows={9} value={patch} placeholder={'{\n  "name": "new-name"\n}'} onChange={event=>setPatch(event.target.value)}/></label><div className="control-actions">{!selected.deleted_at&&<><button className="secondary" onClick={()=>void act(async()=>api.updateControl(aggregate,selected.id,selected.version,JSON.parse(patch)),'Saved with optimistic lock')}>Save patch</button><button className="danger-button" onClick={()=>void act(()=>api.deleteControl(aggregate,selected.id,selected.version),'Soft-deleted')}>Soft delete</button></>}{selected.deleted_at&&<button className="secondary" onClick={()=>void act(()=>api.restoreControl(aggregate,selected.id,selected.version),'Restored')}>Restore</button>}{aggregate==='queues'&&!selected.deleted_at&&<><button onClick={()=>void lifecycle('pause')}>Pause</button><button onClick={()=>void lifecycle('resume')}>Resume</button><button onClick={()=>void lifecycle('drain')}>Drain</button></>}{aggregate==='schedules'&&!selected.deleted_at&&<><button onClick={()=>void lifecycle('pause')}>Pause</button><button onClick={()=>void lifecycle('resume')}>Resume</button></>}</div></div>}</Panel></div>}
-function EventsPage({api}:{api:Api}){const [events,setEvents]=useState<RealtimeEvent[]>([]);const [state,setState]=useState<'connecting'|'live'|'error'>('connecting');useEffect(()=>{const controller=new AbortController();let after=0;void api.events(after,controller.signal).then(response=>parseSse(response,event=>{after=event.id;setEvents(current=>[event,...current].slice(0,150));setState('live')})).catch(()=>{if(!controller.signal.aborted)setState('error')});return()=>controller.abort()},[api]);return <Panel title="Live event stream" subtitle="Durable SSE; reconnecting clients resume from their last event id."><div className="stream-state"><span className={'dot '+(state==='live'?'online':state==='error'?'danger':'')}/>{state==='live'?'Streaming source-of-truth events':state==='error'?'Connection lost - retry by reopening this page':'Connecting…'}</div><div className="event-stream">{events.map(event=><div className="event-card" key={event.id}><div><Badge value={event.event_type}/><strong>{event.aggregate_type}</strong><span className="mono">{short(event.aggregate_id)}</span></div><pre>{JSON.stringify(event.payload,null,2)}</pre><time>{time(event.created_at)}</time></div>)}{!events.length&&<EmptyRow label="Waiting for task state changes…"/>}</div></Panel>}
-function ResourcePicker({api,aggregate,label,value,onChange,required=false,empty='Select a resource'}:{api:Api;aggregate:ControlAggregate;label:string;value:string;onChange:(value:string)=>void;required?:boolean;empty?:string}){const resources=useAsync(()=>api.control(aggregate),[api,aggregate]);return <label><span>{label}</span><select required={required} value={value} onChange={event=>onChange(event.target.value)} disabled={resources.loading}><option value="">{resources.loading?'Loading…':empty}</option>{(resources.data?.items||[]).filter(item=>!item.deleted_at).map(item=><option key={item.id} value={item.id}>{controlName(item)} · {short(item.id)}</option>)}</select></label>}
-function CreatePage({api,notify}:{api:Api;notify:(text:string)=>void}){return <div className="create-layout"><RunComposer api={api} notify={notify}/><section className="stack"><DefinitionForm api={api} notify={notify}/><WorkflowDesigner api={api} notify={notify}/><QueueForm api={api} notify={notify}/><RetryPolicyForm api={api} notify={notify}/><RateLimitPolicyForm api={api} notify={notify}/><RetentionPolicyForm api={api} notify={notify}/><ScheduleForm api={api} notify={notify}/></section></div>}
-function RunComposer({api,notify}:{api:Api;notify:(text:string)=>void}){const [definition,setDefinition]=useState('');const [payload,setPayload]=useState('{\n  "message": "Hello from Flowcraft"\n}');const [idempotency,setIdempotency]=useState('');const [mode,setMode]=useState<'single'|'bulk'>('single');const [busy,setBusy]=useState(false);const submit=async(event:FormEvent)=>{event.preventDefault();setBusy(true);try{const value=JSON.parse(payload);if(mode==='single')await api.createRun(definition,{payload:value,idempotency_key:idempotency||undefined});else await api.bulk({job_definition_id:definition,items:Array.isArray(value)?value.map(item=>({payload:item})):[]});notify(mode==='single'?'Job accepted':'Bulk submission accepted')}catch(error){notify(message(error))}finally{setBusy(false)}};return <Panel title="Submit work" subtitle="Immediate jobs create a durable run, then the outbox publishes it to the queue."><form className="form-stack" onSubmit={submit}><div className="segmented"><button type="button" className={mode==='single'?'selected':''} onClick={()=>setMode('single')}>Single run</button><button type="button" className={mode==='bulk'?'selected':''} onClick={()=>{setMode('bulk');setPayload('[\n  { "message": "first" },\n  { "message": "second" }\n]')}}>Bulk</button></div><ResourcePicker api={api} aggregate="job-definitions" label="Job definition" value={definition} onChange={setDefinition} required/>{mode==='single'&&<Field label="Idempotency key (optional)" value={idempotency} onChange={setIdempotency}/>}<label><span>{mode==='bulk'?'JSON array of payloads':'JSON payload'}</span><textarea value={payload} onChange={event=>setPayload(event.target.value)} rows={mode==='bulk'?12:10}/></label><button className="primary wide" disabled={busy||!definition}>{busy?<LoaderCircle className="spin" size={17}/>:<Send size={17}/>}Submit {mode==='bulk'?'batch of jobs':'job'}</button></form></Panel>}
-function DefinitionForm({api,notify}:{api:Api;notify:(text:string)=>void}){const [functionKey,setFunctionKey]=useState('');const [version,setVersion]=useState('v1');const [schema,setSchema]=useState('{\n  "type": "object",\n  "properties": {\n    "message": { "type": "string" }\n  }\n}');const [functionId,setFunctionId]=useState('');const [queueId,setQueueId]=useState('');const [retryPolicyId,setRetryPolicyId]=useState('');const [name,setName]=useState('');const [mode,setMode]=useState('SINGLE');const [batchSize,setBatchSize]=useState('100');const createFunction=async(event:FormEvent)=>{event.preventDefault();try{const inputSchema=JSON.parse(schema);const response=await api.createFunction({function_key:functionKey,version,input_schema:inputSchema}) as {id:string};setFunctionId(response.id);notify(`Function registered: ${short(response.id)}`)}catch(error){notify(`Schema/function error: ${message(error)}`)}};const createDefinition=async(event:FormEvent)=>{event.preventDefault();try{await api.createDefinition({function_id:functionId,queue_id:queueId,retry_policy_id:retryPolicyId||undefined,name,execution_mode:mode,batch_size:Number(batchSize),timeout_ms:30000});notify('Job definition created')}catch(error){notify(message(error))}};return <Panel title="Register execution" subtitle="JSON Schema is validated by the API on every submitted payload."><form className="form-stack" onSubmit={createFunction}><Field label="Function key" value={functionKey} placeholder="example.echo" onChange={setFunctionKey} required/><Field label="Version" value={version} onChange={setVersion}/><label><span>Input JSON Schema</span><textarea rows={9} value={schema} onChange={event=>setSchema(event.target.value)}/></label><button className="small-button" disabled={!functionKey}><Plus size={14}/>Register function</button></form><div className="divider"/><form className="form-stack" onSubmit={createDefinition}><ResourcePicker api={api} aggregate="function-definitions" label="Function" value={functionId} onChange={setFunctionId} required/><ResourcePicker api={api} aggregate="queues" label="Queue" value={queueId} onChange={setQueueId} required/><ResourcePicker api={api} aggregate="retry-policies" label="Retry policy (optional)" value={retryPolicyId} onChange={setRetryPolicyId} empty="Platform default"/><Field label="Definition name" value={name} onChange={setName} required/><label><span>Execution mode</span><select value={mode} onChange={event=>setMode(event.target.value)}><option>SINGLE</option><option>BATCH</option></select></label>{mode==='BATCH'&&<Field label="Batch size" value={batchSize} onChange={setBatchSize} type="number"/>}<button className="secondary"><Play size={15}/>Create definition</button></form></Panel>}
-function QueueForm({api,notify}:{api:Api;notify:(text:string)=>void}){const [name,setName]=useState('');const [concurrency,setConcurrency]=useState('10');const create=async(event:FormEvent)=>{event.preventDefault();try{const response=await api.createQueue({name,max_concurrency:Number(concurrency)}) as {id:string};notify(`Queue created: ${short(response.id)}`)}catch(error){notify(message(error))}};return <Panel title="Create queue"><form className="compact-form" onSubmit={create}><Field label="Queue name" value={name} onChange={setName} required/><Field label="Concurrency" value={concurrency} onChange={setConcurrency} type="number"/><button className="small-button"><Plus size={14}/>Create</button></form></Panel>}
-function RetryPolicyForm({api,notify}:{api:Api;notify:(text:string)=>void}){const [name,setName]=useState('default-retry');const [attempts,setAttempts]=useState('5');const [strategy,setStrategy]=useState('EXPONENTIAL');const create=async(event:FormEvent)=>{event.preventDefault();try{await api.createRetryPolicy({name,max_attempts:Number(attempts),strategy,initial_delay_ms:1000,multiplier:strategy==='EXPONENTIAL'?2:1,max_delay_ms:60000,jitter_pct:10,retry_timeout:true,retry_rate_limited:true,retry_dependency_error:true,retry_validation_error:false});notify('Retry policy created')}catch(error){notify(message(error))}};return <Panel title="Create retry policy"><form className="compact-form" onSubmit={create}><Field label="Policy name" value={name} onChange={setName} required/><Field label="Max attempts" value={attempts} onChange={setAttempts} type="number"/><label><span>Strategy</span><select value={strategy} onChange={event=>setStrategy(event.target.value)}><option>EXPONENTIAL</option><option>FIXED</option></select></label><button className="small-button"><Plus size={14}/>Create</button></form></Panel>}
-function RateLimitPolicyForm({api,notify}:{api:Api;notify:(text:string)=>void}){const [name,setName]=useState('default-throughput');const [scope,setScope]=useState('PROJECT');const [target,setTarget]=useState('');const [capacity,setCapacity]=useState('100');const [tokens,setTokens]=useState('100');const [period,setPeriod]=useState('1000');const [point,setPoint]=useState('WORKER_START');const create=async(event:FormEvent)=>{event.preventDefault();try{await api.createRateLimitPolicy({name,scope,target_id:scope==='PROJECT'?undefined:target,capacity:Number(capacity),refill_tokens:Number(tokens),refill_period_ms:Number(period),enforcement_point:point});notify('Rate-limit policy created')}catch(error){notify(message(error))}};return <Panel title="Create rate limit" subtitle="SQL-atomic token bucket at submission or worker admission."><form className="compact-form" onSubmit={create}><Field label="Policy name" value={name} onChange={setName} required/><label><span>Scope</span><select value={scope} onChange={event=>{setScope(event.target.value);setTarget('')}}><option>PROJECT</option><option>QUEUE</option><option>FUNCTION</option></select></label>{scope==='QUEUE'&&<ResourcePicker api={api} aggregate="queues" label="Target queue" value={target} onChange={setTarget} required/>}{scope==='FUNCTION'&&<ResourcePicker api={api} aggregate="function-definitions" label="Target function" value={target} onChange={setTarget} required/>}<label><span>Enforcement point</span><select value={point} onChange={event=>setPoint(event.target.value)}><option value="WORKER_START">Worker start</option><option value="SUBMISSION">Submission</option></select></label><Field label="Capacity" value={capacity} onChange={setCapacity} type="number"/><Field label="Refill tokens" value={tokens} onChange={setTokens} type="number"/><Field label="Refill period (ms)" value={period} onChange={setPeriod} type="number"/><button className="small-button"><Plus size={14}/>Create</button></form></Panel>}
-function RetentionPolicyForm({api,notify}:{api:Api;notify:(text:string)=>void}){const [resourceType,setResourceType]=useState('JOB_LOG');const [days,setDays]=useState('30');const create=async(event:FormEvent)=>{event.preventDefault();try{await api.createRetentionPolicy({resource_type:resourceType,retention_days:Number(days)});notify('Retention policy created; worker applies bounded deletes')}catch(error){notify(message(error))}};return <Panel title="Retention & partitions" subtitle="Policies are soft-deletable in Control Plane. Retention runs in bounded worker transactions."><form className="compact-form" onSubmit={create}><label><span>Resource</span><select value={resourceType} onChange={event=>setResourceType(event.target.value)}><option>JOB_LOG</option><option>SCHEDULER_LOG</option><option>REALTIME_EVENT</option><option>AUDIT_LOG</option><option>TERMINAL_RUN</option></select></label><Field label="Retention days" value={days} onChange={setDays} type="number"/><button className="small-button"><Plus size={14}/>Create policy</button></form></Panel>}
-function ScheduleForm({api,notify}:{api:Api;notify:(text:string)=>void}){const [definition,setDefinition]=useState('');const [scheduleType,setScheduleType]=useState<'CRON'|'ONE_TIME'>('CRON');const [cron,setCron]=useState('*/5 * * * *');const [timezone,setTimezone]=useState('UTC');const [withSeconds,setWithSeconds]=useState(false);const [runAt,setRunAt]=useState('');const [misfirePolicy,setMisfirePolicy]=useState('FIRE_ONCE');const [occurrences,setOccurrences]=useState<string[]>([]);const preview=async()=>{try{const result=await api.previewSchedule({cron_expression:cron,timezone,with_seconds:withSeconds});setOccurrences(result.occurrences)}catch(error){setOccurrences([]);notify(message(error))}};const create=async(event:FormEvent)=>{event.preventDefault();try{const body=scheduleType==='CRON'?{job_definition_id:definition,schedule_type:'CRON',cron_expression:cron,timezone,with_seconds:withSeconds,misfire_policy:misfirePolicy}:{job_definition_id:definition,schedule_type:'ONE_TIME',run_at:new Date(runAt).toISOString(),misfire_policy:'FIRE_ONCE'};await api.createSchedule(body);notify(scheduleType==='CRON'?'Schedule created; planner reloads it without a restart':'One-time job scheduled; planner reloads it without a restart')}catch(error){notify(message(error))}};return <Panel title="Schedule job" subtitle="Cron uses canonical preview; one-time schedules are stored as an absolute UTC occurrence."><form className="compact-form" onSubmit={create}><ResourcePicker api={api} aggregate="job-definitions" label="Job definition" value={definition} onChange={setDefinition} required/><label><span>Schedule type</span><select value={scheduleType} onChange={event=>{const next=event.target.value as 'CRON'|'ONE_TIME';setScheduleType(next);setOccurrences([]);if(next==='ONE_TIME')setMisfirePolicy('FIRE_ONCE')}}><option value="CRON">Recurring cron</option><option value="ONE_TIME">One time / delayed</option></select></label>{scheduleType==='CRON'?<><Field label="Cron expression" value={cron} onChange={setCron} required/><Field label="Timezone" value={timezone} onChange={setTimezone}/><label className="toggle"><input type="checkbox" checked={withSeconds} onChange={event=>setWithSeconds(event.target.checked)}/>Six-field cron (seconds)</label><label><span>Misfire policy</span><select value={misfirePolicy} onChange={event=>setMisfirePolicy(event.target.value)}><option value="FIRE_ONCE">Fire once</option><option value="SKIP">Skip missed occurrence</option></select></label></>:<><Field label="Run at (local time)" value={runAt} onChange={setRunAt} type="datetime-local" required/><p className="muted">One-time schedules always fire once after a planner restart.</p></>}<div className="row-actions">{scheduleType==='CRON'&&<button type="button" className="secondary" onClick={()=>void preview()}>Preview next 5</button>}<button className="small-button"><CalendarClock size={14}/>{scheduleType==='CRON'?'Schedule':'Schedule once'}</button></div>{occurrences.length>0&&<div className="mini-list">{occurrences.map(value=><div key={value}><Badge value="NEXT"/><time>{time(value)}</time></div>)}</div>}</form></Panel>}
-type WorkflowStepDraft={key:string;jobDefinitionId:string}
-type WorkflowEdgeDraft={from:string;to:string}
-function WorkflowDesigner({api,notify}:{api:Api;notify:(text:string)=>void}){const [name,setName]=useState('');const [steps,setSteps]=useState<WorkflowStepDraft[]>([{key:'step_1',jobDefinitionId:''}]);const [edges,setEdges]=useState<WorkflowEdgeDraft[]>([]);const changeStep=(index:number,field:keyof WorkflowStepDraft,value:string)=>setSteps(current=>current.map((step,i)=>i===index?{...step,[field]:value}:step));const create=async(event:FormEvent)=>{event.preventDefault();const keys=new Set<string>();if(!name.trim()||!steps.length||steps.some(step=>!/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(step.key)||!step.jobDefinitionId)||steps.some(step=>keys.has(step.key)?true:(keys.add(step.key),false))||edges.some(edge=>!edge.from||!edge.to||edge.from===edge.to)){notify('Workflow needs a unique step key, a job definition per step, and valid edges');return}try{await api.createWorkflow({name,nodes:steps.map(step=>({key:step.key,job_definition_id:step.jobDefinitionId})),edges});notify('Workflow DAG created')}catch(error){notify(message(error))}};return <Panel title="Workflow DAG designer" subtitle="Steps use definition pickers; the API rejects cycles and orphan edges before persisting."><form className="form-stack" onSubmit={create}><Field label="Workflow name" value={name} onChange={setName} required/><div className="mini-list">{steps.map((step,index)=><div key={index} className="form-stack"><Field label={`Step ${index+1} key`} value={step.key} onChange={value=>changeStep(index,'key',value)} required/><ResourcePicker api={api} aggregate="job-definitions" label="Job definition" value={step.jobDefinitionId} onChange={value=>changeStep(index,'jobDefinitionId',value)} required/>{steps.length>1&&<button type="button" className="danger-button" onClick={()=>setSteps(current=>current.filter((_,i)=>i!==index))}>Remove step</button>}</div>)}</div><button type="button" className="secondary" onClick={()=>setSteps(current=>[...current,{key:`step_${current.length+1}`,jobDefinitionId:''}])}><Plus size={14}/>Add step</button>{steps.length>1&&<div className="mini-list">{edges.map((edge,index)=><div key={index} className="row-actions"><select value={edge.from} onChange={event=>setEdges(current=>current.map((entry,i)=>i===index?{...entry,from:event.target.value}:entry))}><option value="">From step</option>{steps.map(step=><option key={step.key}>{step.key}</option>)}</select><span>→</span><select value={edge.to} onChange={event=>setEdges(current=>current.map((entry,i)=>i===index?{...entry,to:event.target.value}:entry))}><option value="">To step</option>{steps.map(step=><option key={step.key}>{step.key}</option>)}</select><button type="button" className="danger-button" onClick={()=>setEdges(current=>current.filter((_,i)=>i!==index))}>Remove</button></div>)}</div>}<button type="button" className="secondary" disabled={steps.length<2} onClick={()=>setEdges(current=>[...current,{from:steps[0].key,to:steps[1].key}])}><Plus size={14}/>Connect steps</button><button className="primary"><Play size={15}/>Create workflow</button></form></Panel>}
-function RunDrawer({run,api,onClose}:{run:Run;api:Api;onClose:()=>void}){const attempts=useAsync(()=>api.attempts(run.id),[api,run.id]);return <Drawer title={`Run ${short(run.id)}`} onClose={onClose}><StatusBlock status={run.status}/><dl className="detail-grid"><dt>Priority</dt><dd>{run.priority}</dd><dt>Created</dt><dd>{time(run.created_at)}</dd><dt>Available</dt><dd>{time(run.available_at)}</dd></dl><h3>Attempts</h3>{attempts.loading?<Loader/>:<div className="attempt-list">{(attempts.data||[]).map(attempt=><div key={attempt.id} className="attempt"><Badge value={attempt.status}/><div><strong>Attempt {attempt.number}</strong><span>{attempt.progress_message||attempt.error_message||'No message'}</span><Progress value={attempt.progress_pct}/></div><time>{time(attempt.started_at)}</time></div>)||<EmptyRow label="No attempt yet"/>}</div>}</Drawer>}
-function BatchDrawer({batch,api,onClose}:{batch:Batch;api:Api;onClose:()=>void}){const details=useAsync(()=>api.batch(batch.id),[api,batch.id]);const items=useAsync(()=>api.batchItems(batch.id),[api,batch.id]);const attempts=useAsync(()=>api.batchAttempts(batch.id),[api,batch.id]);const logs=useAsync(()=>api.batchLogs(batch.id),[api,batch.id]);const current=details.data||batch;return <Drawer title={`Batch ${short(batch.id)}`} onClose={onClose}><StatusBlock status={current.status}/><Progress value={current.progress_pct??percent(current.processed_items,current.total_items)} label={`${current.processed_items}/${current.total_items} items processed`}/><section className="detail-section"><h3>Item result</h3><div className="batch-counts"><Count label="Succeeded" value={current.succeeded_items} tone="green"/><Count label="Failed" value={current.failed_items} tone="rose"/><Count label="Retrying" value={current.retry_scheduled_items} tone="amber"/></div></section><section className="detail-section"><h3>Batch attempts</h3>{(attempts.data||[]).map((attempt:BatchAttempt)=><div className="attempt" key={attempt.id}><Badge value={attempt.status}/><div><strong>Attempt {attempt.attempt_number}</strong><span>{attempt.progress_message||'No progress message'}</span><Progress value={attempt.progress_pct}/></div></div>)}</section><section className="detail-section"><h3>Items</h3><div className="mini-list">{(items.data||[]).map((item:BatchItem)=><div key={item.id}><span>#{item.ordinal+1}</span><Badge value={item.status}/><span className="mono">{short(item.job_run_id)}</span><small>{item.error_message}</small></div>)}</div></section><section className="detail-section"><h3>Structured logs</h3><div className="log-list">{(logs.data||[]).map((log:BatchLog)=><div className="log-line" key={log.id}><Badge value={log.level}/><div><strong>{log.message}</strong><span className="mono">{JSON.stringify(log.fields)}</span></div><time>{time(log.created_at)}</time></div>)}</div></section></Drawer>}
-function Panel({title,subtitle,action,children}:{title:string;subtitle?:string;action?:ReactNode;children:ReactNode}){return <section className="panel"><div className="panel-head"><div><h2>{title}</h2>{subtitle&&<p>{subtitle}</p>}</div>{action}</div>{children}</section>}
-function Metric({label,value,icon,tone}:{label:string;value:number;icon:ReactNode;tone:string}){return <article className={`metric ${tone}`}><div className="metric-icon">{icon}</div><div><span>{label}</span><strong>{value.toLocaleString()}</strong></div></article>}
-function Signal({icon,label,value,warn}:{icon:ReactNode;label:string;value:number;warn?:boolean}){return <div className="signal"><div className={warn?'signal-icon warn':'signal-icon'}>{icon}</div><span>{label}</span><strong>{value}</strong></div>}
-function Count({label,value,tone}:{label:string;value:number;tone:string}){return <div className={`count ${tone}`}><strong>{value}</strong><span>{label}</span></div>}
-function Badge({value}:{value?:string}){const normalized=(value||'unknown').toLowerCase().replaceAll('_','-');return <span className={`badge ${normalized}`}>{value||'UNKNOWN'}</span>}
-function Progress({value,label}:{value:number;label?:string}){return <div className="progress-wrap">{label&&<span>{label}</span>}<div className="progress"><i style={{width:`${Math.max(0,Math.min(value,100))}%`}}/></div><small>{value}%</small></div>}
-function StatusBlock({status}:{status:string}){return <div className="status-block"><Badge value={status}/><span>Current lifecycle state</span></div>}
-function Field({label,value,onChange,placeholder,type='text',required}:{label:string;value:string;onChange:(value:string)=>void;placeholder?:string;type?:string;required?:boolean}){return <label><span>{label}</span><input type={type} required={required} value={value} placeholder={placeholder} onChange={event=>onChange(event.target.value)}/></label>}
-function RefreshButton({onClick}:{onClick:()=>void}){return <button className="icon-button" onClick={()=>void onClick()} title="Refresh"><RefreshCw size={17}/></button>}
-function Drawer({title,onClose,children}:{title:string;onClose:()=>void;children:ReactNode}){return <div className="drawer-backdrop" onMouseDown={onClose}><aside className="drawer" onMouseDown={event=>event.stopPropagation()}><div className="drawer-head"><div><p className="eyebrow">EXECUTION DETAIL</p><h2>{title}</h2></div><button className="icon-button" onClick={onClose}><XCircle size={21}/></button></div>{children}</aside></div>}
-function DataTable({headers,children}:{headers:string[];children:ReactNode}){return <div className="table-wrap"><table><thead><tr>{headers.map(header=><th key={header}>{header}</th>)}</tr></thead><tbody>{children}</tbody></table></div>}
-function RunsTable({runs,loading,onSelect,actions}:{runs:Run[];loading:boolean;onSelect?:(run:Run)=>void;actions?:(run:Run)=>ReactNode}){return <DataTable headers={['Run','Status','Priority','Created','']}>{loading?<tr><td colSpan={5}><Loader/></td></tr>:runs.length?runs.map(run=><tr key={run.id} className={onSelect?'selectable':''} onClick={()=>onSelect?.(run)}><td className="mono">{short(run.id)}</td><td><Badge value={run.status}/></td><td><span className="priority">P{run.priority}</span></td><td>{time(run.created_at)}</td><td>{actions?.(run)}</td></tr>):<tr><td colSpan={5}><EmptyRow label="No runs in this project"/></td></tr>}</DataTable>}
-function BatchTable({batches,loading,onSelect}:{batches:Batch[];loading:boolean;onSelect?:(batch:Batch)=>void}){return <DataTable headers={['Batch','State','Progress','Outcome','Created']}>{loading?<tr><td colSpan={5}><Loader/></td></tr>:batches.length?batches.map(batch=><tr key={batch.id} className={onSelect?'selectable':''} onClick={()=>onSelect?.(batch)}><td className="mono">{short(batch.id)}</td><td><Badge value={batch.status}/></td><td><Progress value={batch.progress_pct??percent(batch.processed_items,batch.total_items)} label={`${batch.processed_items}/${batch.total_items}`}/></td><td><span className="success-text">{batch.succeeded_items} ok</span><span className="failure-text"> · {batch.failed_items} fail</span></td><td>{time(batch.created_at)}</td></tr>):<tr><td colSpan={5}><EmptyRow label="No batch execution yet"/></td></tr>}</DataTable>}
-function WorkersTable({workers}:{workers:Array<{id:string;hostname:string;version:string;status:string;heartbeat_at:string}>}){return <DataTable headers={['Host','State','Version','Heartbeat']}>{workers.map(worker=><tr key={worker.id}><td>{worker.hostname}</td><td><Badge value={worker.status}/></td><td>{worker.version}</td><td>{time(worker.heartbeat_at)}</td></tr>)}</DataTable>}
-function WorkerList({api}:{api:Api}){const workers=useAsync(api.workers,[api]);return workers.loading?<Loader/>:<WorkersTable workers={workers.data||[]}/>}
-function EmptyRow({label}:{label:string}){return <div className="empty-row">{label}</div>}
-function Loader(){return <div className="loader"><LoaderCircle className="spin" size={18}/>Loading…</div>}
+function PageContent({ page, api, notify }: { page: Page; api: Api; notify: (text: string) => void }) {
+  switch (page) {
+    case 'overview':
+      return <Overview api={api} />;
+    case 'runs':
+      return <RunsPage api={api} notify={notify} />;
+    case 'batches':
+      return <BatchesPage api={api} />;
+    case 'control':
+      return <ControlPlanePage api={api} notify={notify} />;
+    case 'operations':
+      return <Operations api={api} notify={notify} />;
+    case 'platform':
+      return <PlatformPage api={api} notify={notify} />;
+    case 'events':
+      return <EventsPage api={api} />;
+    case 'create':
+      return <CreatePage api={api} notify={notify} />;
+  }
+}
+function EmptySetup({ open }: { open: () => void }) {
+  return (
+    <section className="setup">
+      <div className="setup-icon">
+        <Database size={30} />
+      </div>
+      <h2>Connect a workspace</h2>
+      <p>Nhập Tenant ID và Project ID để bắt đầu điều hành task platform qua API đã được scope an toàn.</p>
+      <button className="primary" onClick={open}>
+        Configure connection <ChevronRight size={17} />
+      </button>
+    </section>
+  );
+}
+function ConnectionSheet({
+  connection,
+  onClose,
+  onSave,
+}: {
+  connection: Connection;
+  onClose: () => void;
+  onSave: (value: Connection) => void;
+}) {
+  const [draft, setDraft] = useState(connection);
+  const set = (key: keyof Connection, value: string) => setDraft((current) => ({ ...current, [key]: value }));
+  return (
+    <div className="sheet-backdrop">
+      <section className="sheet">
+        <div className="sheet-head">
+          <div>
+            <p className="eyebrow">DEVELOPMENT IDENTITY</p>
+            <h2>Connection settings</h2>
+          </div>
+          <button className="icon-button" onClick={onClose}>
+            <XCircle size={21} />
+          </button>
+        </div>
+        <p className="muted">Backend hiện dùng header identity. Thay bằng OIDC khi deploy production.</p>
+        <div className="form-grid">
+          <Field
+            label="API base URL"
+            value={draft.baseUrl}
+            placeholder="Để trống khi dùng Vite proxy"
+            onChange={(v) => set('baseUrl', v)}
+          />
+          <Field label="Actor ID" value={draft.actorId} onChange={(v) => set('actorId', v)} />
+          <Field label="Tenant UUID" value={draft.tenantId} onChange={(v) => set('tenantId', v)} />
+          <Field label="Project UUID" value={draft.projectId} onChange={(v) => set('projectId', v)} />
+          <label>
+            <span>Role</span>
+            <select value={draft.role} onChange={(e) => set('role', e.target.value)}>
+              {['admin', 'operator', 'developer', 'viewer'].map((role) => (
+                <option key={role}>{role}</option>
+              ))}
+            </select>
+          </label>
+        </div>
+        <div className="sheet-actions">
+          <button className="ghost" onClick={onClose}>
+            Cancel
+          </button>
+          <button className="primary" onClick={() => onSave(draft)}>
+            Save connection
+          </button>
+        </div>
+      </section>
+    </div>
+  );
+}
+function Overview({ api }: { api: Api }) {
+  const runs = useAsync(api.runs, [api]);
+  const batches = useAsync(api.batches, [api]);
+  const dlq = useAsync(api.dlq, [api]);
+  const workers = useAsync(api.workers, [api]);
+  const activeRuns =
+    runs.data?.filter((run) => ['RUNNING', 'QUEUED', 'RESERVED', 'RETRY_WAIT'].includes(run.status)).length ||
+    0;
+  return (
+    <>
+      <section className="metric-grid">
+        <Metric label="Active runs" value={activeRuns} icon={<Activity />} tone="blue" />
+        <Metric
+          label="Queued batches"
+          value={batches.data?.filter((batch) => ['RESERVED', 'RUNNING'].includes(batch.status)).length || 0}
+          icon={<Layers3 />}
+          tone="purple"
+        />
+        <Metric label="Open DLQ" value={dlq.data?.length || 0} icon={<XCircle />} tone="rose" />
+        <Metric
+          label="Workers online"
+          value={workers.data?.filter((worker) => worker.status === 'ONLINE').length || 0}
+          icon={<Users />}
+          tone="green"
+        />
+      </section>
+      <section className="grid-two">
+        <Panel title="Recent job runs" action={<RefreshButton onClick={runs.refresh} />}>
+          <RunsTable runs={(runs.data || []).slice(0, 6)} loading={runs.loading} />
+        </Panel>
+        <Panel title="Batch health" action={<RefreshButton onClick={batches.refresh} />}>
+          <BatchTable batches={(batches.data || []).slice(0, 6)} loading={batches.loading} />
+        </Panel>
+      </section>
+      <section className="grid-two">
+        <Panel title="Operational signal" subtitle="Thông tin được refetch từ source of truth.">
+          <div className="signal-list">
+            <Signal icon={<ClipboardList />} label="Accepted runs" value={runs.data?.length || 0} />
+            <Signal icon={<Layers3 />} label="Recent batches" value={batches.data?.length || 0} />
+            <Signal icon={<FileClock />} label="DLQ requires review" value={dlq.data?.length || 0} warn />
+          </div>
+        </Panel>
+        <Panel title="Worker fleet">
+          <WorkerList api={api} />
+        </Panel>
+      </section>
+    </>
+  );
+}
+function RunsPage({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const resource = useAsync(api.runs, [api]);
+  const [selected, setSelected] = useState<Run>();
+  const act = async (action: () => Promise<unknown>, success: string) => {
+    try {
+      await action();
+      notify(success);
+      await resource.refresh();
+    } catch (e) {
+      notify(message(e));
+    }
+  };
+  return (
+    <>
+      <Panel
+        title="Execution history"
+        subtitle="Logical run state; open one row for attempt-level details."
+        action={<RefreshButton onClick={resource.refresh} />}
+      >
+        <RunsTable
+          runs={resource.data || []}
+          loading={resource.loading}
+          onSelect={setSelected}
+          actions={(run) => (
+            <div className="row-actions">
+              <button
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void act(() => api.retry(run.id, run.version), 'Run queued for retry');
+                }}
+                title="Retry"
+              >
+                <RotateCcw size={16} />
+              </button>
+              <button
+                onClick={(event) => {
+                  event.stopPropagation();
+                  void act(() => api.cancel(run.id, run.version), 'Run cancelled');
+                }}
+                title="Cancel"
+              >
+                <XCircle size={16} />
+              </button>
+            </div>
+          )}
+        />
+      </Panel>
+      {selected && <RunDrawer run={selected} api={api} onClose={() => setSelected(undefined)} />}
+    </>
+  );
+}
+function BatchesPage({ api }: { api: Api }) {
+  const resource = useAsync(api.batches, [api]);
+  const [selected, setSelected] = useState<Batch>();
+  return (
+    <>
+      <Panel
+        title="Batch executions"
+        subtitle="A batch is one handler invocation; each item keeps its own retry and DLQ lifecycle."
+        action={<RefreshButton onClick={resource.refresh} />}
+      >
+        <BatchTable batches={resource.data || []} loading={resource.loading} onSelect={setSelected} />
+      </Panel>
+      {selected && <BatchDrawer batch={selected} api={api} onClose={() => setSelected(undefined)} />}
+    </>
+  );
+}
+function Operations({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const dlq = useAsync(api.dlq, [api]);
+  const workers = useAsync(api.workers, [api]);
+  const logs = useAsync(api.schedulerLogs, [api]);
+  const audits = useAsync(api.audits, [api]);
+  const replay = async (id: string, version: number) => {
+    try {
+      await api.replayDlq(id, version);
+      notify('DLQ item queued for replay');
+      await dlq.refresh();
+    } catch (e) {
+      notify(message(e));
+    }
+  };
+  return (
+    <div className="stack">
+      <Panel
+        title="Dead letter queue"
+        subtitle="Only operators and administrators can replay a quarantined run."
+        action={<RefreshButton onClick={dlq.refresh} />}
+      >
+        <DataTable headers={['Run', 'Reason', 'Entered', '']}>
+          {(dlq.data || []).map((item) => (
+            <tr key={item.id}>
+              <td className="mono">{short(item.job_run_id)}</td>
+              <td>
+                <Badge value={item.reason} />
+              </td>
+              <td>{time(item.entered_at)}</td>
+              <td>
+                <button className="small-button" onClick={() => void replay(item.id, item.version)}>
+                  <RotateCcw size={14} />
+                  Replay
+                </button>
+              </td>
+            </tr>
+          ))}
+        </DataTable>
+      </Panel>
+      <section className="grid-two">
+        <Panel title="Worker fleet" action={<RefreshButton onClick={workers.refresh} />}>
+          <WorkersTable workers={workers.data || []} />
+        </Panel>
+        <Panel title="Scheduler log" action={<RefreshButton onClick={logs.refresh} />}>
+          <div className="log-list">
+            {logs.data?.items.slice(0, 8).map((log) => (
+              <div className="log-line" key={log.id}>
+                <Badge value={log.level} />
+                <div>
+                  <strong>{log.event_type}</strong>
+                  <span>{log.message}</span>
+                </div>
+                <time>{time(log.occurred_at)}</time>
+              </div>
+            )) || <EmptyRow label="No scheduler log yet" />}
+          </div>
+        </Panel>
+      </section>
+      <Panel title="Audit trail" action={<RefreshButton onClick={audits.refresh} />}>
+        <DataTable headers={['Actor', 'Action', 'Resource', 'At']}>
+          {(audits.data || []).slice(0, 10).map((entry) => (
+            <tr key={entry.id}>
+              <td>{entry.actor_id}</td>
+              <td>{entry.action}</td>
+              <td>
+                <span className="mono">
+                  {entry.resource_type} · {short(entry.resource_id)}
+                </span>
+              </td>
+              <td>{time(entry.created_at)}</td>
+            </tr>
+          ))}
+        </DataTable>
+      </Panel>
+    </div>
+  );
+}
+const controlLabels: Record<ControlAggregate, string> = {
+  queues: 'Queues',
+  'retry-policies': 'Retry policies',
+  'rate-limit-policies': 'Rate limits',
+  'retention-policies': 'Retention',
+  'function-definitions': 'Functions',
+  'job-definitions': 'Job definitions',
+  schedules: 'Schedules',
+};
+function controlName(item: ControlRecord) {
+  return String(item.name || item.function_key || item.cron_expression || item.id);
+}
+function ControlPlanePage({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const [aggregate, setAggregate] = useState<ControlAggregate>('queues');
+  const [includeDeleted, setIncludeDeleted] = useState(false);
+  const resource = useAsync(() => api.control(aggregate, includeDeleted), [api, aggregate, includeDeleted]);
+  const [selected, setSelected] = useState<ControlRecord>();
+  const [patch, setPatch] = useState('');
+  useEffect(() => {
+    setSelected(undefined);
+    setPatch('');
+  }, [aggregate, includeDeleted]);
+  const act = async (work: () => Promise<ControlRecord>, success: string) => {
+    try {
+      const next = await work();
+      setSelected(next);
+      setPatch('');
+      notify(success);
+      await resource.refresh();
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  const lifecycle = async (action: 'pause' | 'resume' | 'drain') => {
+    if (!selected) return;
+    try {
+      if (aggregate === 'queues') await api.queueAction(selected.id, action, selected.version);
+      if (aggregate === 'schedules' && action !== 'drain')
+        await api.scheduleAction(selected.id, action, selected.version);
+      setSelected((current) => (current ? { ...current, version: current.version + 1 } : current));
+      notify('Lifecycle updated');
+      await resource.refresh();
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  return (
+    <div className="grid-two">
+      <Panel
+        title="Control-plane registry"
+        subtitle="All reads include current optimistic-lock version."
+        action={
+          <div className="row-actions">
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={includeDeleted}
+                onChange={(event) => setIncludeDeleted(event.target.checked)}
+              />
+              Deleted
+            </label>
+            <RefreshButton onClick={resource.refresh} />
+          </div>
+        }
+      >
+        <div className="segmented">
+          {(Object.keys(controlLabels) as ControlAggregate[]).map((key) => (
+            <button
+              key={key}
+              type="button"
+              className={aggregate === key ? 'selected' : ''}
+              onClick={() => setAggregate(key)}
+            >
+              {controlLabels[key]}
+            </button>
+          ))}
+        </div>
+        <DataTable headers={['Resource', 'State', 'Version', '']}>
+          {resource.loading ? (
+            <tr>
+              <td colSpan={4}>
+                <Loader />
+              </td>
+            </tr>
+          ) : (
+            (resource.data?.items || []).map((item) => (
+              <tr
+                className="selectable"
+                key={item.id}
+                onClick={() => {
+                  setSelected(item);
+                  setPatch('');
+                }}
+              >
+                <td>
+                  <strong>{controlName(item)}</strong>
+                  <br />
+                  <span className="mono">{short(item.id)}</span>
+                </td>
+                <td>
+                  {item.deleted_at ? <Badge value="DELETED" /> : <Badge value={item.status || 'ACTIVE'} />}
+                </td>
+                <td>v{item.version}</td>
+                <td>
+                  <ChevronRight size={16} />
+                </td>
+              </tr>
+            ))
+          )}
+        </DataTable>
+      </Panel>
+      <Panel
+        title={selected ? controlLabels[aggregate] + ' detail' : 'Select a resource'}
+        subtitle={
+          selected
+            ? 'Patch only mutable fields. If another actor writes first, your request receives PRECONDITION_FAILED.'
+            : 'Select an item to edit, soft-delete, restore or execute its lifecycle action.'
+        }
+      >
+        {selected && (
+          <div className="form-stack">
+            <dl className="detail-grid">
+              <dt>ID</dt>
+              <dd className="mono">{selected.id}</dd>
+              <dt>Version</dt>
+              <dd>{selected.version}</dd>
+              <dt>Deleted</dt>
+              <dd>{selected.deleted_at ? time(selected.deleted_at) : 'No'}</dd>
+            </dl>
+            <label>
+              <span>JSON patch</span>
+              <textarea
+                rows={9}
+                value={patch}
+                placeholder={'{\n  "name": "new-name"\n}'}
+                onChange={(event) => setPatch(event.target.value)}
+              />
+            </label>
+            <div className="control-actions">
+              {!selected.deleted_at && (
+                <>
+                  <button
+                    className="secondary"
+                    onClick={() =>
+                      void act(
+                        async () =>
+                          api.updateControl(aggregate, selected.id, selected.version, JSON.parse(patch)),
+                        'Saved with optimistic lock',
+                      )
+                    }
+                  >
+                    Save patch
+                  </button>
+                  <button
+                    className="danger-button"
+                    onClick={() =>
+                      void act(
+                        () => api.deleteControl(aggregate, selected.id, selected.version),
+                        'Soft-deleted',
+                      )
+                    }
+                  >
+                    Soft delete
+                  </button>
+                </>
+              )}
+              {selected.deleted_at && (
+                <button
+                  className="secondary"
+                  onClick={() =>
+                    void act(() => api.restoreControl(aggregate, selected.id, selected.version), 'Restored')
+                  }
+                >
+                  Restore
+                </button>
+              )}
+              {aggregate === 'queues' && !selected.deleted_at && (
+                <>
+                  <button onClick={() => void lifecycle('pause')}>Pause</button>
+                  <button onClick={() => void lifecycle('resume')}>Resume</button>
+                  <button onClick={() => void lifecycle('drain')}>Drain</button>
+                </>
+              )}
+              {aggregate === 'schedules' && !selected.deleted_at && (
+                <>
+                  <button onClick={() => void lifecycle('pause')}>Pause</button>
+                  <button onClick={() => void lifecycle('resume')}>Resume</button>
+                </>
+              )}
+            </div>
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+
+type PlatformTab = 'backends' | 'rbac' | 'audit';
+function PlatformPage({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const [tab, setTab] = useState<PlatformTab>('backends');
+  return (
+    <div className="stack">
+      <div className="segmented platform-tabs">
+        <button className={tab === 'backends' ? 'selected' : ''} onClick={() => setTab('backends')}>
+          Queue backends
+        </button>
+        <button className={tab === 'rbac' ? 'selected' : ''} onClick={() => setTab('rbac')}>
+          RBAC
+        </button>
+        <button className={tab === 'audit' ? 'selected' : ''} onClick={() => setTab('audit')}>
+          Platform audit
+        </button>
+      </div>
+      {tab === 'backends' && <QueueBackendAdmin api={api} notify={notify} />}
+      {tab === 'rbac' && <RBACAdmin api={api} notify={notify} />}
+      {tab === 'audit' && <PlatformAuditPanel api={api} />}
+    </div>
+  );
+}
+function QueueBackendAdmin({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const [includeDeleted, setIncludeDeleted] = useState(false);
+  const backends = useAsync(() => api.queueBackends(includeDeleted), [api, includeDeleted]);
+  const [selected, setSelected] = useState<ControlRecord>();
+  const [name, setName] = useState('redis-primary');
+  const [backendType, setBackendType] = useState('REDIS_STREAMS');
+  const [config, setConfig] = useState(
+    '{\n  "url": "redis://localhost:6379",\n  "stream": "tasks",\n  "group": "workers"\n}',
+  );
+  const [editName, setEditName] = useState('');
+  const [editStatus, setEditStatus] = useState('ACTIVE');
+  useEffect(() => {
+    if (!selected) return;
+    setEditName(String(selected.name || ''));
+    setEditStatus(String(selected.status || 'ACTIVE'));
+  }, [selected]);
+  const refresh = async () => {
+    setSelected(undefined);
+    await backends.refresh();
+  };
+  const create = async (event: FormEvent) => {
+    event.preventDefault();
+    try {
+      const next = await api.createQueueBackend({
+        name,
+        backend_type: backendType,
+        config: JSON.parse(config),
+      });
+      notify(`Queue backend ${String(next.name)} created`);
+      await refresh();
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  const mutate = async (work: () => Promise<ControlRecord>, success: string) => {
+    try {
+      setSelected(await work());
+      notify(success);
+      await backends.refresh();
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  return (
+    <div className="grid-two platform-grid">
+      <div className="stack">
+        <Panel
+          title="Queue backend registry"
+          subtitle="Connection configuration is encrypted and never returned to this console."
+          action={
+            <div className="row-actions">
+              <label className="toggle">
+                <input
+                  checked={includeDeleted}
+                  onChange={(e) => setIncludeDeleted(e.target.checked)}
+                  type="checkbox"
+                />
+                Deleted
+              </label>
+              <RefreshButton onClick={backends.refresh} />
+            </div>
+          }
+        >
+          <DataTable headers={['Name', 'Type', 'State', 'Version']}>
+            {(backends.data?.items || []).map((backend) => (
+              <tr className="selectable" key={backend.id} onClick={() => setSelected(backend)}>
+                <td>
+                  <strong>{String(backend.name)}</strong>
+                  <br />
+                  <span className="mono">{short(backend.id)}</span>
+                </td>
+                <td>{String(backend.backend_type)}</td>
+                <td>
+                  <Badge value={backend.deleted_at ? 'DELETED' : String(backend.status || 'ACTIVE')} />
+                </td>
+                <td>v{backend.version}</td>
+              </tr>
+            ))}
+          </DataTable>
+          {!backends.loading && !(backends.data?.items || []).length && (
+            <EmptyRow label="No queue backend configured" />
+          )}
+        </Panel>
+        <Panel
+          title="Create encrypted backend"
+          subtitle="The configuration is validated before encryption; it is never echoed back."
+        >
+          <form className="form-stack" onSubmit={create}>
+            <Field label="Name" required value={name} onChange={setName} />
+            <label>
+              <span>Backend type</span>
+              <select value={backendType} onChange={(e) => setBackendType(e.target.value)}>
+                <option>REDIS_STREAMS</option>
+                <option>JETSTREAM</option>
+              </select>
+            </label>
+            <label>
+              <span>Connection JSON</span>
+              <textarea rows={7} value={config} onChange={(e) => setConfig(e.target.value)} />
+            </label>
+            <button className="primary">
+              <Plus size={15} />
+              Create backend
+            </button>
+          </form>
+        </Panel>
+      </div>
+      <Panel
+        title={selected ? 'Backend details' : 'Select a backend'}
+        subtitle="Every mutation uses the version returned by the selected row."
+      >
+        {selected && (
+          <div className="form-stack">
+            <dl className="detail-grid">
+              <dt>ID</dt>
+              <dd className="mono">{selected.id}</dd>
+              <dt>Version</dt>
+              <dd>v{selected.version}</dd>
+              <dt>Deleted</dt>
+              <dd>{selected.deleted_at ? time(String(selected.deleted_at)) : 'No'}</dd>
+            </dl>
+            {!selected.deleted_at && (
+              <>
+                <Field label="Display name" value={editName} onChange={setEditName} />
+                <label>
+                  <span>Status</span>
+                  <select value={editStatus} onChange={(e) => setEditStatus(e.target.value)}>
+                    <option>ACTIVE</option>
+                    <option>DISABLED</option>
+                  </select>
+                </label>
+              </>
+            )}
+            <div className="control-actions">
+              {!selected.deleted_at && (
+                <>
+                  <button
+                    className="secondary"
+                    onClick={() =>
+                      void mutate(
+                        () =>
+                          api.updateQueueBackend(selected.id, selected.version, {
+                            name: editName,
+                            status: editStatus,
+                          }),
+                        'Backend updated',
+                      )
+                    }
+                  >
+                    Save
+                  </button>
+                  <button
+                    className="danger-button"
+                    onClick={() =>
+                      void mutate(
+                        () => api.deleteQueueBackend(selected.id, selected.version),
+                        'Backend soft-deleted',
+                      )
+                    }
+                  >
+                    Soft delete
+                  </button>
+                </>
+              )}
+              {selected.deleted_at && (
+                <button
+                  className="secondary"
+                  onClick={() =>
+                    void mutate(
+                      () => api.restoreQueueBackend(selected.id, selected.version),
+                      'Backend restored',
+                    )
+                  }
+                >
+                  Restore
+                </button>
+              )}
+            </div>
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+function ids(item: ControlRecord | undefined, key: string) {
+  return Array.isArray(item?.[key]) ? (item?.[key] as string[]) : [];
+}
+function RBACAdmin({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const [includeDeleted, setIncludeDeleted] = useState(false);
+  const users = useAsync(() => api.rbacUsers(includeDeleted), [api, includeDeleted]);
+  const roles = useAsync(() => api.rbacRoles(includeDeleted), [api, includeDeleted]);
+  const permissions = useAsync(api.rbacPermissions, [api]);
+  const [selectedUser, setSelectedUser] = useState<ControlRecord>();
+  const [selectedRole, setSelectedRole] = useState<ControlRecord>();
+  const [userRoleIDs, setUserRoleIDs] = useState<string[]>([]);
+  const [permissionIDs, setPermissionIDs] = useState<string[]>([]);
+  const [subject, setSubject] = useState('');
+  const [displayName, setDisplayName] = useState('');
+  const [roleKey, setRoleKey] = useState('operator');
+  const [roleName, setRoleName] = useState('Operator');
+  useEffect(() => setUserRoleIDs(ids(selectedUser, 'role_ids')), [selectedUser]);
+  useEffect(() => setPermissionIDs(ids(selectedRole, 'permission_ids')), [selectedRole]);
+  const refresh = async () => {
+    await Promise.all([users.refresh(), roles.refresh(), permissions.refresh()]);
+  };
+  const toggle = (current: string[], id: string) =>
+    current.includes(id) ? current.filter((entry) => entry !== id) : [...current, id];
+  const act = async (work: () => Promise<ControlRecord>, success: string, kind: 'user' | 'role') => {
+    try {
+      const next = await work();
+      if (kind === 'user') setSelectedUser(next);
+      else setSelectedRole(next);
+      notify(success);
+      await refresh();
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  return (
+    <div className="stack">
+      <Panel
+        title="RBAC registry"
+        subtitle="Mapping changes advance the selected parent version and reject stale writes."
+        action={
+          <div className="row-actions">
+            <label className="toggle">
+              <input
+                checked={includeDeleted}
+                onChange={(e) => setIncludeDeleted(e.target.checked)}
+                type="checkbox"
+              />
+              Deleted
+            </label>
+            <RefreshButton onClick={refresh} />
+          </div>
+        }
+      >
+        <div className="rbac-columns">
+          <div>
+            <h3>Users</h3>
+            <div className="mini-list">
+              {(users.data?.items || []).map((user) => (
+                <button
+                  className={selectedUser?.id === user.id ? 'selected-row' : ''}
+                  key={user.id}
+                  onClick={() => setSelectedUser(user)}
+                >
+                  <span>
+                    <strong>{String(user.display_name)}</strong>
+                    <small>{String(user.subject)}</small>
+                  </span>
+                  <Badge value={user.deleted_at ? 'DELETED' : String(user.status || 'ACTIVE')} />
+                </button>
+              ))}
+            </div>
+          </div>
+          <div>
+            <h3>Roles</h3>
+            <div className="mini-list">
+              {(roles.data?.items || []).map((role) => (
+                <button
+                  className={selectedRole?.id === role.id ? 'selected-row' : ''}
+                  key={role.id}
+                  onClick={() => setSelectedRole(role)}
+                >
+                  <span>
+                    <strong>{String(role.display_name)}</strong>
+                    <small>{String(role.role_key)}</small>
+                  </span>
+                  <Badge value={role.deleted_at ? 'DELETED' : String(role.status || 'ACTIVE')} />
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      </Panel>
+      <div className="grid-two platform-grid">
+        <div className="stack">
+          <Panel title="Create user">
+            <form
+              className="compact-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void act(
+                  () => api.createRBACUser({ subject, display_name: displayName }),
+                  'User created',
+                  'user',
+                );
+              }}
+            >
+              <Field label="Subject" required value={subject} onChange={setSubject} />
+              <Field label="Display name" required value={displayName} onChange={setDisplayName} />
+              <button className="small-button">
+                <Plus size={14} />
+                Create
+              </button>
+            </form>
+          </Panel>
+          <Panel title="Create role">
+            <form
+              className="compact-form"
+              onSubmit={(event) => {
+                event.preventDefault();
+                void act(
+                  () => api.createRBACRole({ role_key: roleKey, display_name: roleName }),
+                  'Role created',
+                  'role',
+                );
+              }}
+            >
+              <Field label="Role key" required value={roleKey} onChange={setRoleKey} />
+              <Field label="Display name" required value={roleName} onChange={setRoleName} />
+              <button className="small-button">
+                <Plus size={14} />
+                Create
+              </button>
+            </form>
+          </Panel>
+        </div>
+        <div className="stack">
+          <Panel title={selectedUser ? `User: ${String(selectedUser.display_name)}` : 'Select a user'}>
+            {selectedUser && (
+              <div className="form-stack">
+                <p className="muted">Select the active roles to replace this user’s mapping.</p>
+                <CheckboxList
+                  entries={(roles.data?.items || [])
+                    .filter((role) => !role.deleted_at)
+                    .map((role) => ({
+                      id: role.id,
+                      label: `${String(role.display_name)} · ${String(role.role_key)}`,
+                    }))}
+                  selected={userRoleIDs}
+                  onChange={setUserRoleIDs}
+                />
+                <div className="control-actions">
+                  {!selectedUser.deleted_at && (
+                    <>
+                      <button
+                        className="secondary"
+                        onClick={() =>
+                          void act(
+                            () => api.replaceUserRoles(selectedUser.id, selectedUser.version, userRoleIDs),
+                            'User roles replaced',
+                            'user',
+                          )
+                        }
+                      >
+                        Save roles
+                      </button>
+                      <button
+                        onClick={() =>
+                          void act(
+                            () =>
+                              api.updateRBACUser(selectedUser.id, selectedUser.version, {
+                                status: selectedUser.status === 'ACTIVE' ? 'DISABLED' : 'ACTIVE',
+                              }),
+                            'User status updated',
+                            'user',
+                          )
+                        }
+                      >
+                        {selectedUser.status === 'ACTIVE' ? 'Disable' : 'Enable'}
+                      </button>
+                      <button
+                        className="danger-button"
+                        onClick={() =>
+                          void act(
+                            () => api.deleteRBACUser(selectedUser.id, selectedUser.version),
+                            'User soft-deleted',
+                            'user',
+                          )
+                        }
+                      >
+                        Delete
+                      </button>
+                    </>
+                  )}
+                  {selectedUser.deleted_at && (
+                    <button
+                      className="secondary"
+                      onClick={() =>
+                        void act(
+                          () => api.restoreRBACUser(selectedUser.id, selectedUser.version),
+                          'User restored',
+                          'user',
+                        )
+                      }
+                    >
+                      Restore
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+          </Panel>
+          <Panel title={selectedRole ? `Role: ${String(selectedRole.display_name)}` : 'Select a role'}>
+            {selectedRole && (
+              <div className="form-stack">
+                <p className="muted">Permissions are validated before the mapping is replaced.</p>
+                <CheckboxList
+                  entries={(permissions.data || []).map((permission) => ({
+                    id: permission.id,
+                    label: permission.permission_key,
+                  }))}
+                  selected={permissionIDs}
+                  onChange={setPermissionIDs}
+                />
+                <div className="control-actions">
+                  {!selectedRole.deleted_at && (
+                    <>
+                      <button
+                        className="secondary"
+                        onClick={() =>
+                          void act(
+                            () =>
+                              api.replaceRolePermissions(
+                                selectedRole.id,
+                                selectedRole.version,
+                                permissionIDs,
+                              ),
+                            'Role permissions replaced',
+                            'role',
+                          )
+                        }
+                      >
+                        Save permissions
+                      </button>
+                      <button
+                        onClick={() =>
+                          void act(
+                            () =>
+                              api.updateRBACRole(selectedRole.id, selectedRole.version, {
+                                status: selectedRole.status === 'ACTIVE' ? 'DISABLED' : 'ACTIVE',
+                              }),
+                            'Role status updated',
+                            'role',
+                          )
+                        }
+                      >
+                        {selectedRole.status === 'ACTIVE' ? 'Disable' : 'Enable'}
+                      </button>
+                      <button
+                        className="danger-button"
+                        onClick={() =>
+                          void act(
+                            () => api.deleteRBACRole(selectedRole.id, selectedRole.version),
+                            'Role soft-deleted',
+                            'role',
+                          )
+                        }
+                      >
+                        Delete
+                      </button>
+                    </>
+                  )}
+                  {selectedRole.deleted_at && (
+                    <button
+                      className="secondary"
+                      onClick={() =>
+                        void act(
+                          () => api.restoreRBACRole(selectedRole.id, selectedRole.version),
+                          'Role restored',
+                          'role',
+                        )
+                      }
+                    >
+                      Restore
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+          </Panel>
+        </div>
+      </div>
+    </div>
+  );
+}
+function CheckboxList({
+  entries,
+  selected,
+  onChange,
+}: {
+  entries: Array<{ id: string; label: string }>;
+  selected: string[];
+  onChange: (next: string[]) => void;
+}) {
+  return (
+    <div className="checkbox-list">
+      {entries.map((entry) => (
+        <label key={entry.id}>
+          <input
+            type="checkbox"
+            checked={selected.includes(entry.id)}
+            onChange={() =>
+              onChange(
+                selected.includes(entry.id)
+                  ? selected.filter((id) => id !== entry.id)
+                  : [...selected, entry.id],
+              )
+            }
+          />
+          <span>{entry.label}</span>
+        </label>
+      ))}
+    </div>
+  );
+}
+function PlatformAuditPanel({ api }: { api: Api }) {
+  const audits = useAsync(api.platformAudits, [api]);
+  const [selected, setSelected] = useState<PlatformAudit>();
+  return (
+    <div className="grid-two platform-grid">
+      <Panel
+        title="Platform audit trail"
+        subtitle="Durable evidence with the HTTP request and distributed trace correlation."
+        action={<RefreshButton onClick={audits.refresh} />}
+      >
+        <DataTable headers={['Actor', 'Action', 'Resource', 'Time']}>
+          {(audits.data?.items || []).map((entry) => (
+            <tr className="selectable" key={entry.id} onClick={() => setSelected(entry)}>
+              <td>{entry.actor_id}</td>
+              <td>{entry.action}</td>
+              <td className="mono">
+                {entry.resource_type} · {short(entry.resource_id)}
+              </td>
+              <td>{time(entry.created_at)}</td>
+            </tr>
+          ))}
+        </DataTable>
+        {!audits.loading && !(audits.data?.items || []).length && (
+          <EmptyRow label="No platform audit event yet" />
+        )}
+      </Panel>
+      <Panel
+        title={selected ? 'Audit event detail' : 'Select an audit event'}
+        subtitle="The outbox delivers this durable record externally with at-least-once semantics."
+      >
+        {selected && (
+          <div className="form-stack">
+            <dl className="detail-grid">
+              <dt>Request</dt>
+              <dd className="mono">{selected.request_id || '—'}</dd>
+              <dt>Trace</dt>
+              <dd className="mono">{selected.trace_id || '—'}</dd>
+              <dt>Actor</dt>
+              <dd>{selected.actor_id}</dd>
+            </dl>
+            <label>
+              <span>Before</span>
+              <textarea readOnly rows={7} value={JSON.stringify(selected.before_data, null, 2)} />
+            </label>
+            <label>
+              <span>After</span>
+              <textarea readOnly rows={7} value={JSON.stringify(selected.after_data, null, 2)} />
+            </label>
+          </div>
+        )}
+      </Panel>
+    </div>
+  );
+}
+function EventsPage({ api }: { api: Api }) {
+  const [events, setEvents] = useState<RealtimeEvent[]>([]);
+  const [state, setState] = useState<'connecting' | 'live' | 'error'>('connecting');
+  useEffect(() => {
+    const controller = new AbortController();
+    let after = 0;
+    void api
+      .events(after, controller.signal)
+      .then((response) =>
+        parseSse(response, (event) => {
+          after = event.id;
+          setEvents((current) => [event, ...current].slice(0, 150));
+          setState('live');
+        }),
+      )
+      .catch(() => {
+        if (!controller.signal.aborted) setState('error');
+      });
+    return () => controller.abort();
+  }, [api]);
+  return (
+    <Panel
+      title="Live event stream"
+      subtitle="Durable SSE; reconnecting clients resume from their last event id."
+    >
+      <div className="stream-state">
+        <span className={'dot ' + (state === 'live' ? 'online' : state === 'error' ? 'danger' : '')} />
+        {state === 'live'
+          ? 'Streaming source-of-truth events'
+          : state === 'error'
+            ? 'Connection lost - retry by reopening this page'
+            : 'Connecting…'}
+      </div>
+      <div className="event-stream">
+        {events.map((event) => (
+          <div className="event-card" key={event.id}>
+            <div>
+              <Badge value={event.event_type} />
+              <strong>{event.aggregate_type}</strong>
+              <span className="mono">{short(event.aggregate_id)}</span>
+            </div>
+            <pre>{JSON.stringify(event.payload, null, 2)}</pre>
+            <time>{time(event.created_at)}</time>
+          </div>
+        ))}
+        {!events.length && <EmptyRow label="Waiting for task state changes…" />}
+      </div>
+    </Panel>
+  );
+}
+function ResourcePicker({
+  api,
+  aggregate,
+  label,
+  value,
+  onChange,
+  required = false,
+  empty = 'Select a resource',
+}: {
+  api: Api;
+  aggregate: ControlAggregate;
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  required?: boolean;
+  empty?: string;
+}) {
+  const resources = useAsync(() => api.control(aggregate), [api, aggregate]);
+  return (
+    <label>
+      <span>{label}</span>
+      <select
+        required={required}
+        value={value}
+        onChange={(event) => onChange(event.target.value)}
+        disabled={resources.loading}
+      >
+        <option value="">{resources.loading ? 'Loading…' : empty}</option>
+        {(resources.data?.items || [])
+          .filter((item) => !item.deleted_at)
+          .map((item) => (
+            <option key={item.id} value={item.id}>
+              {controlName(item)} · {short(item.id)}
+            </option>
+          ))}
+      </select>
+    </label>
+  );
+}
+function CreatePage({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  return (
+    <div className="create-layout">
+      <RunComposer api={api} notify={notify} />
+      <section className="stack">
+        <DefinitionForm api={api} notify={notify} />
+        <WorkflowDesigner api={api} notify={notify} />
+        <QueueForm api={api} notify={notify} />
+        <RetryPolicyForm api={api} notify={notify} />
+        <RateLimitPolicyForm api={api} notify={notify} />
+        <RetentionPolicyForm api={api} notify={notify} />
+        <ScheduleForm api={api} notify={notify} />
+      </section>
+    </div>
+  );
+}
+function RunComposer({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const [definition, setDefinition] = useState('');
+  const [payload, setPayload] = useState('{\n  "message": "Hello from Flowcraft"\n}');
+  const [idempotency, setIdempotency] = useState('');
+  const [mode, setMode] = useState<'single' | 'bulk'>('single');
+  const [busy, setBusy] = useState(false);
+  const submit = async (event: FormEvent) => {
+    event.preventDefault();
+    setBusy(true);
+    try {
+      const value = JSON.parse(payload);
+      if (mode === 'single')
+        await api.createRun(definition, { payload: value, idempotency_key: idempotency || undefined });
+      else
+        await api.bulk({
+          job_definition_id: definition,
+          items: Array.isArray(value) ? value.map((item) => ({ payload: item })) : [],
+        });
+      notify(mode === 'single' ? 'Job accepted' : 'Bulk submission accepted');
+    } catch (error) {
+      notify(message(error));
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Panel
+      title="Submit work"
+      subtitle="Immediate jobs create a durable run, then the outbox publishes it to the queue."
+    >
+      <form className="form-stack" onSubmit={submit}>
+        <div className="segmented">
+          <button
+            type="button"
+            className={mode === 'single' ? 'selected' : ''}
+            onClick={() => setMode('single')}
+          >
+            Single run
+          </button>
+          <button
+            type="button"
+            className={mode === 'bulk' ? 'selected' : ''}
+            onClick={() => {
+              setMode('bulk');
+              setPayload('[\n  { "message": "first" },\n  { "message": "second" }\n]');
+            }}
+          >
+            Bulk
+          </button>
+        </div>
+        <ResourcePicker
+          api={api}
+          aggregate="job-definitions"
+          label="Job definition"
+          value={definition}
+          onChange={setDefinition}
+          required
+        />
+        {mode === 'single' && (
+          <Field label="Idempotency key (optional)" value={idempotency} onChange={setIdempotency} />
+        )}
+        <label>
+          <span>{mode === 'bulk' ? 'JSON array of payloads' : 'JSON payload'}</span>
+          <textarea
+            value={payload}
+            onChange={(event) => setPayload(event.target.value)}
+            rows={mode === 'bulk' ? 12 : 10}
+          />
+        </label>
+        <button className="primary wide" disabled={busy || !definition}>
+          {busy ? <LoaderCircle className="spin" size={17} /> : <Send size={17} />}Submit{' '}
+          {mode === 'bulk' ? 'batch of jobs' : 'job'}
+        </button>
+      </form>
+    </Panel>
+  );
+}
+function DefinitionForm({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const [functionKey, setFunctionKey] = useState('');
+  const [version, setVersion] = useState('v1');
+  const [schema, setSchema] = useState(
+    '{\n  "type": "object",\n  "properties": {\n    "message": { "type": "string" }\n  }\n}',
+  );
+  const [functionId, setFunctionId] = useState('');
+  const [queueId, setQueueId] = useState('');
+  const [retryPolicyId, setRetryPolicyId] = useState('');
+  const [name, setName] = useState('');
+  const [mode, setMode] = useState('SINGLE');
+  const [batchSize, setBatchSize] = useState('100');
+  const createFunction = async (event: FormEvent) => {
+    event.preventDefault();
+    try {
+      const inputSchema = JSON.parse(schema);
+      const response = (await api.createFunction({
+        function_key: functionKey,
+        version,
+        input_schema: inputSchema,
+      })) as { id: string };
+      setFunctionId(response.id);
+      notify(`Function registered: ${short(response.id)}`);
+    } catch (error) {
+      notify(`Schema/function error: ${message(error)}`);
+    }
+  };
+  const createDefinition = async (event: FormEvent) => {
+    event.preventDefault();
+    try {
+      await api.createDefinition({
+        function_id: functionId,
+        queue_id: queueId,
+        retry_policy_id: retryPolicyId || undefined,
+        name,
+        execution_mode: mode,
+        batch_size: Number(batchSize),
+        timeout_ms: 30000,
+      });
+      notify('Job definition created');
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  return (
+    <Panel
+      title="Register execution"
+      subtitle="JSON Schema is validated by the API on every submitted payload."
+    >
+      <form className="form-stack" onSubmit={createFunction}>
+        <Field
+          label="Function key"
+          value={functionKey}
+          placeholder="example.echo"
+          onChange={setFunctionKey}
+          required
+        />
+        <Field label="Version" value={version} onChange={setVersion} />
+        <label>
+          <span>Input JSON Schema</span>
+          <textarea rows={9} value={schema} onChange={(event) => setSchema(event.target.value)} />
+        </label>
+        <button className="small-button" disabled={!functionKey}>
+          <Plus size={14} />
+          Register function
+        </button>
+      </form>
+      <div className="divider" />
+      <form className="form-stack" onSubmit={createDefinition}>
+        <ResourcePicker
+          api={api}
+          aggregate="function-definitions"
+          label="Function"
+          value={functionId}
+          onChange={setFunctionId}
+          required
+        />
+        <ResourcePicker
+          api={api}
+          aggregate="queues"
+          label="Queue"
+          value={queueId}
+          onChange={setQueueId}
+          required
+        />
+        <ResourcePicker
+          api={api}
+          aggregate="retry-policies"
+          label="Retry policy (optional)"
+          value={retryPolicyId}
+          onChange={setRetryPolicyId}
+          empty="Platform default"
+        />
+        <Field label="Definition name" value={name} onChange={setName} required />
+        <label>
+          <span>Execution mode</span>
+          <select value={mode} onChange={(event) => setMode(event.target.value)}>
+            <option>SINGLE</option>
+            <option>BATCH</option>
+          </select>
+        </label>
+        {mode === 'BATCH' && (
+          <Field label="Batch size" value={batchSize} onChange={setBatchSize} type="number" />
+        )}
+        <button className="secondary">
+          <Play size={15} />
+          Create definition
+        </button>
+      </form>
+    </Panel>
+  );
+}
+function QueueForm({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const [name, setName] = useState('');
+  const [concurrency, setConcurrency] = useState('10');
+  const create = async (event: FormEvent) => {
+    event.preventDefault();
+    try {
+      const response = (await api.createQueue({ name, max_concurrency: Number(concurrency) })) as {
+        id: string;
+      };
+      notify(`Queue created: ${short(response.id)}`);
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  return (
+    <Panel title="Create queue">
+      <form className="compact-form" onSubmit={create}>
+        <Field label="Queue name" value={name} onChange={setName} required />
+        <Field label="Concurrency" value={concurrency} onChange={setConcurrency} type="number" />
+        <button className="small-button">
+          <Plus size={14} />
+          Create
+        </button>
+      </form>
+    </Panel>
+  );
+}
+function RetryPolicyForm({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const [name, setName] = useState('default-retry');
+  const [attempts, setAttempts] = useState('5');
+  const [strategy, setStrategy] = useState('EXPONENTIAL');
+  const create = async (event: FormEvent) => {
+    event.preventDefault();
+    try {
+      await api.createRetryPolicy({
+        name,
+        max_attempts: Number(attempts),
+        strategy,
+        initial_delay_ms: 1000,
+        multiplier: strategy === 'EXPONENTIAL' ? 2 : 1,
+        max_delay_ms: 60000,
+        jitter_pct: 10,
+        retry_timeout: true,
+        retry_rate_limited: true,
+        retry_dependency_error: true,
+        retry_validation_error: false,
+      });
+      notify('Retry policy created');
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  return (
+    <Panel title="Create retry policy">
+      <form className="compact-form" onSubmit={create}>
+        <Field label="Policy name" value={name} onChange={setName} required />
+        <Field label="Max attempts" value={attempts} onChange={setAttempts} type="number" />
+        <label>
+          <span>Strategy</span>
+          <select value={strategy} onChange={(event) => setStrategy(event.target.value)}>
+            <option>EXPONENTIAL</option>
+            <option>FIXED</option>
+          </select>
+        </label>
+        <button className="small-button">
+          <Plus size={14} />
+          Create
+        </button>
+      </form>
+    </Panel>
+  );
+}
+function RateLimitPolicyForm({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const [name, setName] = useState('default-throughput');
+  const [scope, setScope] = useState('PROJECT');
+  const [target, setTarget] = useState('');
+  const [capacity, setCapacity] = useState('100');
+  const [tokens, setTokens] = useState('100');
+  const [period, setPeriod] = useState('1000');
+  const [point, setPoint] = useState('WORKER_START');
+  const create = async (event: FormEvent) => {
+    event.preventDefault();
+    try {
+      await api.createRateLimitPolicy({
+        name,
+        scope,
+        target_id: scope === 'PROJECT' ? undefined : target,
+        capacity: Number(capacity),
+        refill_tokens: Number(tokens),
+        refill_period_ms: Number(period),
+        enforcement_point: point,
+      });
+      notify('Rate-limit policy created');
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  return (
+    <Panel title="Create rate limit" subtitle="SQL-atomic token bucket at submission or worker admission.">
+      <form className="compact-form" onSubmit={create}>
+        <Field label="Policy name" value={name} onChange={setName} required />
+        <label>
+          <span>Scope</span>
+          <select
+            value={scope}
+            onChange={(event) => {
+              setScope(event.target.value);
+              setTarget('');
+            }}
+          >
+            <option>PROJECT</option>
+            <option>QUEUE</option>
+            <option>FUNCTION</option>
+          </select>
+        </label>
+        {scope === 'QUEUE' && (
+          <ResourcePicker
+            api={api}
+            aggregate="queues"
+            label="Target queue"
+            value={target}
+            onChange={setTarget}
+            required
+          />
+        )}
+        {scope === 'FUNCTION' && (
+          <ResourcePicker
+            api={api}
+            aggregate="function-definitions"
+            label="Target function"
+            value={target}
+            onChange={setTarget}
+            required
+          />
+        )}
+        <label>
+          <span>Enforcement point</span>
+          <select value={point} onChange={(event) => setPoint(event.target.value)}>
+            <option value="WORKER_START">Worker start</option>
+            <option value="SUBMISSION">Submission</option>
+          </select>
+        </label>
+        <Field label="Capacity" value={capacity} onChange={setCapacity} type="number" />
+        <Field label="Refill tokens" value={tokens} onChange={setTokens} type="number" />
+        <Field label="Refill period (ms)" value={period} onChange={setPeriod} type="number" />
+        <button className="small-button">
+          <Plus size={14} />
+          Create
+        </button>
+      </form>
+    </Panel>
+  );
+}
+function RetentionPolicyForm({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const [resourceType, setResourceType] = useState('JOB_LOG');
+  const [days, setDays] = useState('30');
+  const create = async (event: FormEvent) => {
+    event.preventDefault();
+    try {
+      await api.createRetentionPolicy({ resource_type: resourceType, retention_days: Number(days) });
+      notify('Retention policy created; worker applies bounded deletes');
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  return (
+    <Panel
+      title="Retention & partitions"
+      subtitle="Policies are soft-deletable in Control Plane. Retention runs in bounded worker transactions."
+    >
+      <form className="compact-form" onSubmit={create}>
+        <label>
+          <span>Resource</span>
+          <select value={resourceType} onChange={(event) => setResourceType(event.target.value)}>
+            <option>JOB_LOG</option>
+            <option>SCHEDULER_LOG</option>
+            <option>REALTIME_EVENT</option>
+            <option>AUDIT_LOG</option>
+            <option>TERMINAL_RUN</option>
+          </select>
+        </label>
+        <Field label="Retention days" value={days} onChange={setDays} type="number" />
+        <button className="small-button">
+          <Plus size={14} />
+          Create policy
+        </button>
+      </form>
+    </Panel>
+  );
+}
+function ScheduleForm({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const [definition, setDefinition] = useState('');
+  const [scheduleType, setScheduleType] = useState<'CRON' | 'ONE_TIME'>('CRON');
+  const [cron, setCron] = useState('*/5 * * * *');
+  const [timezone, setTimezone] = useState('UTC');
+  const [withSeconds, setWithSeconds] = useState(false);
+  const [runAt, setRunAt] = useState('');
+  const [misfirePolicy, setMisfirePolicy] = useState('FIRE_ONCE');
+  const [occurrences, setOccurrences] = useState<string[]>([]);
+  const preview = async () => {
+    try {
+      const result = await api.previewSchedule({
+        cron_expression: cron,
+        timezone,
+        with_seconds: withSeconds,
+      });
+      setOccurrences(result.occurrences);
+    } catch (error) {
+      setOccurrences([]);
+      notify(message(error));
+    }
+  };
+  const create = async (event: FormEvent) => {
+    event.preventDefault();
+    try {
+      const body =
+        scheduleType === 'CRON'
+          ? {
+              job_definition_id: definition,
+              schedule_type: 'CRON',
+              cron_expression: cron,
+              timezone,
+              with_seconds: withSeconds,
+              misfire_policy: misfirePolicy,
+            }
+          : {
+              job_definition_id: definition,
+              schedule_type: 'ONE_TIME',
+              run_at: new Date(runAt).toISOString(),
+              misfire_policy: 'FIRE_ONCE',
+            };
+      await api.createSchedule(body);
+      notify(
+        scheduleType === 'CRON'
+          ? 'Schedule created; planner reloads it without a restart'
+          : 'One-time job scheduled; planner reloads it without a restart',
+      );
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  return (
+    <Panel
+      title="Schedule job"
+      subtitle="Cron uses canonical preview; one-time schedules are stored as an absolute UTC occurrence."
+    >
+      <form className="compact-form" onSubmit={create}>
+        <ResourcePicker
+          api={api}
+          aggregate="job-definitions"
+          label="Job definition"
+          value={definition}
+          onChange={setDefinition}
+          required
+        />
+        <label>
+          <span>Schedule type</span>
+          <select
+            value={scheduleType}
+            onChange={(event) => {
+              const next = event.target.value as 'CRON' | 'ONE_TIME';
+              setScheduleType(next);
+              setOccurrences([]);
+              if (next === 'ONE_TIME') setMisfirePolicy('FIRE_ONCE');
+            }}
+          >
+            <option value="CRON">Recurring cron</option>
+            <option value="ONE_TIME">One time / delayed</option>
+          </select>
+        </label>
+        {scheduleType === 'CRON' ? (
+          <>
+            <Field label="Cron expression" value={cron} onChange={setCron} required />
+            <Field label="Timezone" value={timezone} onChange={setTimezone} />
+            <label className="toggle">
+              <input
+                type="checkbox"
+                checked={withSeconds}
+                onChange={(event) => setWithSeconds(event.target.checked)}
+              />
+              Six-field cron (seconds)
+            </label>
+            <label>
+              <span>Misfire policy</span>
+              <select value={misfirePolicy} onChange={(event) => setMisfirePolicy(event.target.value)}>
+                <option value="FIRE_ONCE">Fire once</option>
+                <option value="SKIP">Skip missed occurrence</option>
+              </select>
+            </label>
+          </>
+        ) : (
+          <>
+            <Field
+              label="Run at (local time)"
+              value={runAt}
+              onChange={setRunAt}
+              type="datetime-local"
+              required
+            />
+            <p className="muted">One-time schedules always fire once after a planner restart.</p>
+          </>
+        )}
+        <div className="row-actions">
+          {scheduleType === 'CRON' && (
+            <button type="button" className="secondary" onClick={() => void preview()}>
+              Preview next 5
+            </button>
+          )}
+          <button className="small-button">
+            <CalendarClock size={14} />
+            {scheduleType === 'CRON' ? 'Schedule' : 'Schedule once'}
+          </button>
+        </div>
+        {occurrences.length > 0 && (
+          <div className="mini-list">
+            {occurrences.map((value) => (
+              <div key={value}>
+                <Badge value="NEXT" />
+                <time>{time(value)}</time>
+              </div>
+            ))}
+          </div>
+        )}
+      </form>
+    </Panel>
+  );
+}
+type WorkflowStepDraft = { key: string; jobDefinitionId: string };
+type WorkflowEdgeDraft = { from: string; to: string };
+function WorkflowDesigner({ api, notify }: { api: Api; notify: (text: string) => void }) {
+  const [name, setName] = useState('');
+  const [steps, setSteps] = useState<WorkflowStepDraft[]>([{ key: 'step_1', jobDefinitionId: '' }]);
+  const [edges, setEdges] = useState<WorkflowEdgeDraft[]>([]);
+  const changeStep = (index: number, field: keyof WorkflowStepDraft, value: string) =>
+    setSteps((current) => current.map((step, i) => (i === index ? { ...step, [field]: value } : step)));
+  const create = async (event: FormEvent) => {
+    event.preventDefault();
+    const keys = new Set<string>();
+    if (
+      !name.trim() ||
+      !steps.length ||
+      steps.some((step) => !/^[a-zA-Z][a-zA-Z0-9_-]{0,63}$/.test(step.key) || !step.jobDefinitionId) ||
+      steps.some((step) => (keys.has(step.key) ? true : (keys.add(step.key), false))) ||
+      edges.some((edge) => !edge.from || !edge.to || edge.from === edge.to)
+    ) {
+      notify('Workflow needs a unique step key, a job definition per step, and valid edges');
+      return;
+    }
+    try {
+      await api.createWorkflow({
+        name,
+        nodes: steps.map((step) => ({ key: step.key, job_definition_id: step.jobDefinitionId })),
+        edges,
+      });
+      notify('Workflow DAG created');
+    } catch (error) {
+      notify(message(error));
+    }
+  };
+  return (
+    <Panel
+      title="Workflow DAG designer"
+      subtitle="Steps use definition pickers; the API rejects cycles and orphan edges before persisting."
+    >
+      <form className="form-stack" onSubmit={create}>
+        <Field label="Workflow name" value={name} onChange={setName} required />
+        <div className="mini-list">
+          {steps.map((step, index) => (
+            <div key={index} className="form-stack">
+              <Field
+                label={`Step ${index + 1} key`}
+                value={step.key}
+                onChange={(value) => changeStep(index, 'key', value)}
+                required
+              />
+              <ResourcePicker
+                api={api}
+                aggregate="job-definitions"
+                label="Job definition"
+                value={step.jobDefinitionId}
+                onChange={(value) => changeStep(index, 'jobDefinitionId', value)}
+                required
+              />
+              {steps.length > 1 && (
+                <button
+                  type="button"
+                  className="danger-button"
+                  onClick={() => setSteps((current) => current.filter((_, i) => i !== index))}
+                >
+                  Remove step
+                </button>
+              )}
+            </div>
+          ))}
+        </div>
+        <button
+          type="button"
+          className="secondary"
+          onClick={() =>
+            setSteps((current) => [...current, { key: `step_${current.length + 1}`, jobDefinitionId: '' }])
+          }
+        >
+          <Plus size={14} />
+          Add step
+        </button>
+        {steps.length > 1 && (
+          <div className="mini-list">
+            {edges.map((edge, index) => (
+              <div key={index} className="row-actions">
+                <select
+                  value={edge.from}
+                  onChange={(event) =>
+                    setEdges((current) =>
+                      current.map((entry, i) =>
+                        i === index ? { ...entry, from: event.target.value } : entry,
+                      ),
+                    )
+                  }
+                >
+                  <option value="">From step</option>
+                  {steps.map((step) => (
+                    <option key={step.key}>{step.key}</option>
+                  ))}
+                </select>
+                <span>→</span>
+                <select
+                  value={edge.to}
+                  onChange={(event) =>
+                    setEdges((current) =>
+                      current.map((entry, i) => (i === index ? { ...entry, to: event.target.value } : entry)),
+                    )
+                  }
+                >
+                  <option value="">To step</option>
+                  {steps.map((step) => (
+                    <option key={step.key}>{step.key}</option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="danger-button"
+                  onClick={() => setEdges((current) => current.filter((_, i) => i !== index))}
+                >
+                  Remove
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+        <button
+          type="button"
+          className="secondary"
+          disabled={steps.length < 2}
+          onClick={() => setEdges((current) => [...current, { from: steps[0].key, to: steps[1].key }])}
+        >
+          <Plus size={14} />
+          Connect steps
+        </button>
+        <button className="primary">
+          <Play size={15} />
+          Create workflow
+        </button>
+      </form>
+    </Panel>
+  );
+}
+function RunDrawer({ run, api, onClose }: { run: Run; api: Api; onClose: () => void }) {
+  const attempts = useAsync(() => api.attempts(run.id), [api, run.id]);
+  return (
+    <Drawer title={`Run ${short(run.id)}`} onClose={onClose}>
+      <StatusBlock status={run.status} />
+      <dl className="detail-grid">
+        <dt>Priority</dt>
+        <dd>{run.priority}</dd>
+        <dt>Created</dt>
+        <dd>{time(run.created_at)}</dd>
+        <dt>Available</dt>
+        <dd>{time(run.available_at)}</dd>
+      </dl>
+      <h3>Attempts</h3>
+      {attempts.loading ? (
+        <Loader />
+      ) : (
+        <div className="attempt-list">
+          {(attempts.data || []).map((attempt) => (
+            <div key={attempt.id} className="attempt">
+              <Badge value={attempt.status} />
+              <div>
+                <strong>Attempt {attempt.number}</strong>
+                <span>{attempt.progress_message || attempt.error_message || 'No message'}</span>
+                <Progress value={attempt.progress_pct} />
+              </div>
+              <time>{time(attempt.started_at)}</time>
+            </div>
+          )) || <EmptyRow label="No attempt yet" />}
+        </div>
+      )}
+    </Drawer>
+  );
+}
+function BatchDrawer({ batch, api, onClose }: { batch: Batch; api: Api; onClose: () => void }) {
+  const details = useAsync(() => api.batch(batch.id), [api, batch.id]);
+  const items = useAsync(() => api.batchItems(batch.id), [api, batch.id]);
+  const attempts = useAsync(() => api.batchAttempts(batch.id), [api, batch.id]);
+  const logs = useAsync(() => api.batchLogs(batch.id), [api, batch.id]);
+  const current = details.data || batch;
+  return (
+    <Drawer title={`Batch ${short(batch.id)}`} onClose={onClose}>
+      <StatusBlock status={current.status} />
+      <Progress
+        value={current.progress_pct ?? percent(current.processed_items, current.total_items)}
+        label={`${current.processed_items}/${current.total_items} items processed`}
+      />
+      <section className="detail-section">
+        <h3>Item result</h3>
+        <div className="batch-counts">
+          <Count label="Succeeded" value={current.succeeded_items} tone="green" />
+          <Count label="Failed" value={current.failed_items} tone="rose" />
+          <Count label="Retrying" value={current.retry_scheduled_items} tone="amber" />
+        </div>
+      </section>
+      <section className="detail-section">
+        <h3>Batch attempts</h3>
+        {(attempts.data || []).map((attempt: BatchAttempt) => (
+          <div className="attempt" key={attempt.id}>
+            <Badge value={attempt.status} />
+            <div>
+              <strong>Attempt {attempt.attempt_number}</strong>
+              <span>{attempt.progress_message || 'No progress message'}</span>
+              <Progress value={attempt.progress_pct} />
+            </div>
+          </div>
+        ))}
+      </section>
+      <section className="detail-section">
+        <h3>Items</h3>
+        <div className="mini-list">
+          {(items.data || []).map((item: BatchItem) => (
+            <div key={item.id}>
+              <span>#{item.ordinal + 1}</span>
+              <Badge value={item.status} />
+              <span className="mono">{short(item.job_run_id)}</span>
+              <small>{item.error_message}</small>
+            </div>
+          ))}
+        </div>
+      </section>
+      <section className="detail-section">
+        <h3>Structured logs</h3>
+        <div className="log-list">
+          {(logs.data || []).map((log: BatchLog) => (
+            <div className="log-line" key={log.id}>
+              <Badge value={log.level} />
+              <div>
+                <strong>{log.message}</strong>
+                <span className="mono">{JSON.stringify(log.fields)}</span>
+              </div>
+              <time>{time(log.created_at)}</time>
+            </div>
+          ))}
+        </div>
+      </section>
+    </Drawer>
+  );
+}
+function Panel({
+  title,
+  subtitle,
+  action,
+  children,
+}: {
+  title: string;
+  subtitle?: string;
+  action?: ReactNode;
+  children: ReactNode;
+}) {
+  return (
+    <section className="panel">
+      <div className="panel-head">
+        <div>
+          <h2>{title}</h2>
+          {subtitle && <p>{subtitle}</p>}
+        </div>
+        {action}
+      </div>
+      {children}
+    </section>
+  );
+}
+function Metric({
+  label,
+  value,
+  icon,
+  tone,
+}: {
+  label: string;
+  value: number;
+  icon: ReactNode;
+  tone: string;
+}) {
+  return (
+    <article className={`metric ${tone}`}>
+      <div className="metric-icon">{icon}</div>
+      <div>
+        <span>{label}</span>
+        <strong>{value.toLocaleString()}</strong>
+      </div>
+    </article>
+  );
+}
+function Signal({
+  icon,
+  label,
+  value,
+  warn,
+}: {
+  icon: ReactNode;
+  label: string;
+  value: number;
+  warn?: boolean;
+}) {
+  return (
+    <div className="signal">
+      <div className={warn ? 'signal-icon warn' : 'signal-icon'}>{icon}</div>
+      <span>{label}</span>
+      <strong>{value}</strong>
+    </div>
+  );
+}
+function Count({ label, value, tone }: { label: string; value: number; tone: string }) {
+  return (
+    <div className={`count ${tone}`}>
+      <strong>{value}</strong>
+      <span>{label}</span>
+    </div>
+  );
+}
+function Badge({ value }: { value?: string }) {
+  const normalized = (value || 'unknown').toLowerCase().replaceAll('_', '-');
+  return <span className={`badge ${normalized}`}>{value || 'UNKNOWN'}</span>;
+}
+function Progress({ value, label }: { value: number; label?: string }) {
+  return (
+    <div className="progress-wrap">
+      {label && <span>{label}</span>}
+      <div className="progress">
+        <i style={{ width: `${Math.max(0, Math.min(value, 100))}%` }} />
+      </div>
+      <small>{value}%</small>
+    </div>
+  );
+}
+function StatusBlock({ status }: { status: string }) {
+  return (
+    <div className="status-block">
+      <Badge value={status} />
+      <span>Current lifecycle state</span>
+    </div>
+  );
+}
+function Field({
+  label,
+  value,
+  onChange,
+  placeholder,
+  type = 'text',
+  required,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  placeholder?: string;
+  type?: string;
+  required?: boolean;
+}) {
+  return (
+    <label>
+      <span>{label}</span>
+      <input
+        type={type}
+        required={required}
+        value={value}
+        placeholder={placeholder}
+        onChange={(event) => onChange(event.target.value)}
+      />
+    </label>
+  );
+}
+function RefreshButton({ onClick }: { onClick: () => void }) {
+  return (
+    <button className="icon-button" onClick={() => void onClick()} title="Refresh">
+      <RefreshCw size={17} />
+    </button>
+  );
+}
+function Drawer({ title, onClose, children }: { title: string; onClose: () => void; children: ReactNode }) {
+  return (
+    <div className="drawer-backdrop" onMouseDown={onClose}>
+      <aside className="drawer" onMouseDown={(event) => event.stopPropagation()}>
+        <div className="drawer-head">
+          <div>
+            <p className="eyebrow">EXECUTION DETAIL</p>
+            <h2>{title}</h2>
+          </div>
+          <button className="icon-button" onClick={onClose}>
+            <XCircle size={21} />
+          </button>
+        </div>
+        {children}
+      </aside>
+    </div>
+  );
+}
+function DataTable({ headers, children }: { headers: string[]; children: ReactNode }) {
+  return (
+    <div className="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            {headers.map((header) => (
+              <th key={header}>{header}</th>
+            ))}
+          </tr>
+        </thead>
+        <tbody>{children}</tbody>
+      </table>
+    </div>
+  );
+}
+function RunsTable({
+  runs,
+  loading,
+  onSelect,
+  actions,
+}: {
+  runs: Run[];
+  loading: boolean;
+  onSelect?: (run: Run) => void;
+  actions?: (run: Run) => ReactNode;
+}) {
+  return (
+    <DataTable headers={['Run', 'Status', 'Priority', 'Created', '']}>
+      {loading ? (
+        <tr>
+          <td colSpan={5}>
+            <Loader />
+          </td>
+        </tr>
+      ) : runs.length ? (
+        runs.map((run) => (
+          <tr key={run.id} className={onSelect ? 'selectable' : ''} onClick={() => onSelect?.(run)}>
+            <td className="mono">{short(run.id)}</td>
+            <td>
+              <Badge value={run.status} />
+            </td>
+            <td>
+              <span className="priority">P{run.priority}</span>
+            </td>
+            <td>{time(run.created_at)}</td>
+            <td>{actions?.(run)}</td>
+          </tr>
+        ))
+      ) : (
+        <tr>
+          <td colSpan={5}>
+            <EmptyRow label="No runs in this project" />
+          </td>
+        </tr>
+      )}
+    </DataTable>
+  );
+}
+function BatchTable({
+  batches,
+  loading,
+  onSelect,
+}: {
+  batches: Batch[];
+  loading: boolean;
+  onSelect?: (batch: Batch) => void;
+}) {
+  return (
+    <DataTable headers={['Batch', 'State', 'Progress', 'Outcome', 'Created']}>
+      {loading ? (
+        <tr>
+          <td colSpan={5}>
+            <Loader />
+          </td>
+        </tr>
+      ) : batches.length ? (
+        batches.map((batch) => (
+          <tr key={batch.id} className={onSelect ? 'selectable' : ''} onClick={() => onSelect?.(batch)}>
+            <td className="mono">{short(batch.id)}</td>
+            <td>
+              <Badge value={batch.status} />
+            </td>
+            <td>
+              <Progress
+                value={batch.progress_pct ?? percent(batch.processed_items, batch.total_items)}
+                label={`${batch.processed_items}/${batch.total_items}`}
+              />
+            </td>
+            <td>
+              <span className="success-text">{batch.succeeded_items} ok</span>
+              <span className="failure-text"> · {batch.failed_items} fail</span>
+            </td>
+            <td>{time(batch.created_at)}</td>
+          </tr>
+        ))
+      ) : (
+        <tr>
+          <td colSpan={5}>
+            <EmptyRow label="No batch execution yet" />
+          </td>
+        </tr>
+      )}
+    </DataTable>
+  );
+}
+function WorkersTable({
+  workers,
+}: {
+  workers: Array<{ id: string; hostname: string; version: string; status: string; heartbeat_at: string }>;
+}) {
+  return (
+    <DataTable headers={['Host', 'State', 'Version', 'Heartbeat']}>
+      {workers.map((worker) => (
+        <tr key={worker.id}>
+          <td>{worker.hostname}</td>
+          <td>
+            <Badge value={worker.status} />
+          </td>
+          <td>{worker.version}</td>
+          <td>{time(worker.heartbeat_at)}</td>
+        </tr>
+      ))}
+    </DataTable>
+  );
+}
+function WorkerList({ api }: { api: Api }) {
+  const workers = useAsync(api.workers, [api]);
+  return workers.loading ? <Loader /> : <WorkersTable workers={workers.data || []} />;
+}
+function EmptyRow({ label }: { label: string }) {
+  return <div className="empty-row">{label}</div>;
+}
+function Loader() {
+  return (
+    <div className="loader">
+      <LoaderCircle className="spin" size={18} />
+      Loading…
+    </div>
+  );
+}

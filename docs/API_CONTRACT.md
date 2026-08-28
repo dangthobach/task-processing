@@ -34,6 +34,7 @@ stale/missing precondition returns `412`/`428`.
 | Control-plane creation | queue, retry policy, function definition, job definition, schedule | yes |
 | Control-plane management | list/detail/patch/soft-delete/restore for all five aggregates | yes |
 | Control-plane lifecycle | queue pause/resume/drain; schedule pause/resume | yes, from management UI |
+| Platform configuration | queue backend CRUD/restore, RBAC user/role/mapping CRUD/restore | API client ready |
 
 For each of queues, retry-policies, function-definitions, job-definitions and schedules:
 
@@ -75,3 +76,27 @@ and task attempt records.
 definitions and schedules support soft deletion through `deleted_at` and
 `deleted_by`. Runtime executions, attempts, batches, DLQ, audit and outbox
 records are append-only evidence and must never be soft-deleted.
+
+## Platform configuration and RBAC
+
+`queue_backends` is a platform aggregate. Its encrypted configuration is write-only:
+the API exposes neither ciphertext nor plaintext. `GET/PATCH/DELETE /api/v1/queue-backends/{id}`
+and `POST /api/v1/queue-backends/{id}/restore` require platform administration;
+all mutations except creation require `If-Match`.
+
+RBAC follows the same contract for `/api/v1/rbac/users/{id}` and
+`/api/v1/rbac/roles/{id}`. Replacing user roles or role permissions also requires
+the parent version in `If-Match`; the server validates every referenced ID before
+replacing the mapping and advances that parent version transactionally. Use
+`include_deleted=true` to locate records eligible for restore.
+
+These mutations write to `platform_audit_logs` and one matching
+`platform_audit_outbox_events` record in the exact database transaction as the
+aggregate change. Platform administrators can inspect tenant-scoped records through
+`GET /api/v1/platform-audit-logs`; it includes request and trace IDs.
+
+The worker sends both project and platform audit outboxes to `TASK_AUDIT_SINK_URL`
+using at-least-once HTTP delivery. Platform events have `scope: "PLATFORM"` and
+`tenant_id` (not `project_id`); sinks must deduplicate with `X-Audit-Event-ID`.
+Claims are fenced, failures use bounded exponential backoff, and a poison event is
+marked expired after 20 attempts while its immutable audit log remains queryable.
